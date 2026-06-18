@@ -178,4 +178,4 @@ This work builds upon [Swin-UMamba](https://github.com/JiarunLiu/Swin-UMamba). W
 
 ## License
 
-This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
