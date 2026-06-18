@@ -172,7 +172,7 @@ If you find this work useful, please cite:
 
 ## Acknowledgements
 
-This work builds on [Swin-UMamba](https://github.com/JiarunLiu/Swin-UMamba). We thank the AMOS22, Kvasir-SEG, EndoVis17, and NeurIPS CellSeg challenge organizers for providing the datasets.
+This work builds on [Swin-UMamba](https://github.com/JiarunLiu/Swin-UMamba). 
 
 ---
 
