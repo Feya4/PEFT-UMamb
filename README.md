@@ -131,7 +131,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_instance_f1_v2.py \
 | AMOS22 AbdomenMRI | 0.6916 | [Google Drive](https://drive.google.com/XXXX) |
 | Kvasir-SEG | 0.8034 | [Google Drive](https://drive.google.com/XXXX) |
 | EndoVis17 | 0.7781 | [Google Drive](https://drive.google.com/XXXX) |
-| NeurIPS CellSeg | 0.8892 | [Google Drive](https://drive.google.com/XXXX) |
+| NeurIPS CellSeg | 0.8892/0.6347 | [Google Drive](https://drive.google.com/XXXX) |
 
 ## Project Structure
 
