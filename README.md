@@ -172,7 +172,7 @@ If you find this work useful, please cite:
 
 ## Acknowledgements
 
-This work builds on [Swin-UMamba](https://github.com/JiarunLiu/Swin-UMamba). 
+This work builds upon [Swin-UMamba](https://github.com/JiarunLiu/Swin-UMamba). We sincerely thank the authors for their wonderful contributions.
 
 ---
 
