@@ -5,14 +5,13 @@ PEFT-UMamba is a parameter-efficient fine-tuning framework for medical image seg
 
 ## Installation
 
+```bash
 pip install torch==2.0.1 torchvision==0.15.2
 pip install causal-conv1d==1.1.1
 pip install mamba-ssm
 pip install timm nibabel monai scipy scikit-image
 pip install opencv-python matplotlib tqdm
-git clone https://github.com/feya/PEFT-UMamba.git
-cd PEFT-UMamba
----
+```
 
 ## Pretrained Backbone
 
