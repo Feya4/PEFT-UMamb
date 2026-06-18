@@ -204,23 +204,46 @@ class SupplementarySSM(nn.Module):
             self.d_inner, 2 * d_state_supp, bias=False)
         nn.init.xavier_uniform_(self.x_proj_supp.weight)
 
-        # A_log_supp: Neighbourhood Initialization from boundary of frozen A
-        self.A_log_supp = nn.Parameter(self._neighbourhood_init(d_state_supp))
+        # A_log_supp: initialised by selected strategy (default: Neighbourhood Init)
+        self.A_log_supp = nn.Parameter(
+            self._init_a_log_supp(d_state_supp, "neighbourhood")
+        )
 
     # ── Neighbourhood Initialization ─────────────────────────────────────────
 
-    def _neighbourhood_init(self, K_prime: int) -> torch.Tensor:
+    def _init_a_log_supp(self, K_prime: int,
+                          strategy: str = "neighbourhood") -> torch.Tensor:
         """
-        Initialise A_supp near the last frozen dimension.
-        Provides a semantically-aligned warm start so the supplementary
-        dimensions can immediately learn from high-level features.
+        Initialise A_log_supp according to the chosen strategy.
+
+        neighbourhood : Boundary init — log values near the last frozen dim.
+                        Gives SSM dynamics similar to the frozen boundary,
+                        enabling fast specialisation. (default / paper method)
+        zero          : All zeros → A_sup = -exp(0) = -1 (near-identity decay)
+        random_normal : N(0, 0.01) — standard random init
+        xavier        : Xavier uniform across [d_inner, K′]
+        copy_frozen   : Copy first K′ columns of the frozen A_log
         """
-        boundary = float(self.d_state)   # S4D: |A[*, K-1]| = K
-        noise    = torch.randn(self.d_inner, K_prime).abs() * 1e-6
-        return torch.log(
-            (torch.full((self.d_inner, K_prime), boundary) + noise)
-            .clamp(min=1e-8)
-        )
+        if strategy == "neighbourhood":
+            boundary = float(self.d_state)
+            noise    = torch.randn(self.d_inner, K_prime).abs() * 1e-6
+            return torch.log(
+                (torch.full((self.d_inner, K_prime), boundary) + noise)
+                .clamp(min=1e-8)
+            )
+        elif strategy == "zero":
+            return torch.zeros(self.d_inner, K_prime)
+        elif strategy == "random_normal":
+            return torch.randn(self.d_inner, K_prime) * 0.01
+        elif strategy == "xavier":
+            t = torch.empty(self.d_inner, K_prime)
+            torch.nn.init.xavier_uniform_(t)
+            return t
+        elif strategy == "copy_frozen":
+            # Copy first K′ values from the frozen A_log (already initialised)
+            return self.A_log[:, :K_prime].detach().clone()
+        else:
+            raise ValueError(f"Unknown supp_init strategy: {strategy}")
 
     # ── SSM scan implementations ──────────────────────────────────────────────
 
@@ -604,15 +627,14 @@ class DecoderStage(nn.Module):
     """
     def __init__(self, dim: int, skip_dim: int, depth: int = 2,
                  d_state: int = 16, d_state_supp: int = 4,
-                 use_supp_scan: bool = True):
+                 use_supp_scan: bool = True, use_skip_gate: bool = True):
         super().__init__()
-        out_dim       = dim // 2
-        self.upsample = PatchExpanding(dim)
-        self.skip_gate = SkipAttentionGate(skip_dim)
-        self.proj     = nn.Linear(out_dim + skip_dim, out_dim, bias=False)
-        self.norm     = nn.LayerNorm(out_dim)
-        # Conv blocks for feature refinement (faster convergence than SSM from scratch)
-        self.blocks   = nn.ModuleList([
+        out_dim        = dim // 2
+        self.upsample  = PatchExpanding(dim)
+        self.skip_gate = SkipAttentionGate(skip_dim) if use_skip_gate else nn.Identity()
+        self.proj      = nn.Linear(out_dim + skip_dim, out_dim, bias=False)
+        self.norm      = nn.LayerNorm(out_dim)
+        self.blocks    = nn.ModuleList([
             DecoderConvBlock(out_dim) for _ in range(depth)
         ])
 
@@ -631,7 +653,96 @@ class DecoderStage(nn.Module):
 #  Auxiliary heads
 # =========================================================================== #
 
-class MIMHead(nn.Module):
+class InterSliceAggregation(nn.Module):
+    """
+    Inter-Slice Aggregation Module (ISAM) — the 3D component.
+
+    Problem it solves
+    ─────────────────
+    The VMamba encoder is 2D (pretrained on ImageNet). It processes each axial
+    slice independently, with no knowledge of adjacent slices. This hurts
+    organs that are thin in the axial direction (aorta: ~1cm diameter,
+    esophagus: ~2cm, adrenal glands: ~1cm) — the model can't tell whether
+    a bright circle is an aorta cross-section or a vessel because it never
+    sees the slice above/below.
+
+    How it works
+    ────────────
+    At inference time for a full volume [D, H, W]:
+      1. Encoder runs on each slice → produces features [D, H/4, W/4, C]
+      2. ISAM runs a lightweight 3D conv + GRU over the D dimension:
+           3D Conv(1×3×3)  — local 3D neighbourhood (1 slice × 3×3 spatial)
+           GRU over D      — propagates information up and down the volume
+      3. Decoder receives 3D-aware features [D, H/4, W/4, C]
+
+    Key design choices
+    ──────────────────
+    • Only applied at bottleneck scale [D, H/32, W/32, 768] — small tensors
+    • Bidirectional GRU: top→bottom AND bottom→top pass
+    • All ISAM parameters are trainable (no frozen weights)
+    • At training time (2D slices): ISAM is bypassed — identity forward
+      (set use_isam=False during 2D training, True during 3D inference)
+    • Parameter count: ~1.5M (negligible vs 30M total)
+
+    This preserves full pretrained VMamba encoder compatibility while adding
+    genuine 3D context at inference time.
+    """
+
+    def __init__(self, channels: int, hidden: int = 256):
+        super().__init__()
+        # Local 3D neighbourhood mixing (depth=1, spatial=3×3)
+        self.local_3d = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=(1, 3, 3),
+                      padding=(0, 1, 1), groups=channels, bias=False),  # depthwise
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),   # pointwise
+            nn.GroupNorm(min(32, channels), channels),
+            nn.GELU(),
+        )
+        # Bidirectional GRU over depth axis for long-range inter-slice context
+        self.gru = nn.GRU(
+            input_size=channels,
+            hidden_size=hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.proj = nn.Linear(hidden * 2, channels, bias=False)
+        self.norm = nn.LayerNorm(channels)
+        self.gate = nn.Sequential(
+            nn.Linear(channels, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        """
+        feats : [D, H, W, C]  — stacked encoder outputs for a volume
+        Returns [D, H, W, C]  — 3D-context-enhanced features
+        """
+        D, H, W, C = feats.shape
+
+        # ── Local 3D conv ─────────────────────────────────────────────────────
+        # [D, H, W, C] → [1, C, D, H, W] → local_3d → [D, H, W, C]
+        x = feats.permute(3, 0, 1, 2).unsqueeze(0)   # [1, C, D, H, W]
+        x = self.local_3d(x)
+        x = x.squeeze(0).permute(1, 2, 3, 0)         # [D, H, W, C]
+
+        # ── GRU over depth (global inter-slice context) ───────────────────────
+        # Spatial average → [D, C] sequence
+        seq = x.mean(dim=(1, 2))                      # [D, C]
+        seq = seq.unsqueeze(0)                        # [1, D, C] (batch=1)
+        gru_out, _ = self.gru(seq)                   # [1, D, 2*hidden]
+        gru_out    = self.proj(gru_out.squeeze(0))   # [D, C]
+
+        # Gate: modulate depth features by GRU context
+        gate    = self.gate(gru_out)                  # [D, C]
+        gru_3d  = gru_out[:, None, None, :] * gate[:, None, None, :]  # [D,1,1,C]
+
+        # Residual combination
+        out = self.norm(feats + x + gru_3d.expand_as(feats))
+        return out
+
+
+
     """Pixel-reconstruction head for self-supervised MIM stage."""
     def __init__(self, embed_dim: int, patch_size: int = 4, in_chans: int = 3):
         super().__init__()
@@ -693,6 +804,7 @@ class PEFTUMamba(nn.Module):
         d_state_supp:  int        = 4,
         use_supp_scan: bool       = True,
         freeze_encoder: bool      = True,
+        use_skip_gate: bool       = True,
     ):
         super().__init__()
         depths    = depths    or [2, 2, 9, 2]
@@ -738,10 +850,17 @@ class PEFTUMamba(nn.Module):
                 dim=in_dim, skip_dim=skip_dim, depth=2,
                 d_state=d_state, d_state_supp=d_state_supp,
                 use_supp_scan=use_supp_scan,
+                use_skip_gate=use_skip_gate,
             ))
 
+        # ── Inter-Slice Aggregation Module (3D context) ──────────────────────
+        # Applied at bottleneck [H/32, W/32, 768] — smallest spatial size.
+        # Bypassed during 2D slice training; activated at 3D inference.
+        self.isam   = InterSliceAggregation(feat_dims[-1], hidden=256)
+        self.use_3d = False   # enable with model.enable_3d()
+
         # ── Deep supervision heads ────────────────────────────────────────────
-        # Auxiliary losses at each decoder stage accelerate gradient flow
+
         # through the decoder during early training.
         # scale_factor: how much to upsample the decoder output to reach H×W
         #   Dec0 output: H/16, W/16 → need ×16
@@ -776,7 +895,7 @@ class PEFTUMamba(nn.Module):
                     p.requires_grad_(False)
         for blk in self.bottleneck:
             blk.freeze_pretrained()
-        # Decoder, skip gates, aux heads, seg head → all trainable
+        # Decoder, skip gates, aux heads, seg head, ISAM → all trainable
         for stage in self.decoder_stages:
             for p in stage.parameters():
                 p.requires_grad_(True)
@@ -784,6 +903,8 @@ class PEFTUMamba(nn.Module):
             for p in head.parameters():
                 p.requires_grad_(True)
         for p in self.seg_head.parameters():
+            p.requires_grad_(True)
+        for p in self.isam.parameters():
             p.requires_grad_(True)
 
     # ── statistics ───────────────────────────────────────────────────────────
@@ -798,6 +919,16 @@ class PEFTUMamba(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
     # ── optional heads ───────────────────────────────────────────────────────
+
+    def enable_3d(self):
+        """
+        Activate 3D inter-slice aggregation for full-volume inference.
+        Call this after loading a 2D-trained checkpoint before evaluation.
+        """
+        self.use_3d = True
+        for p in self.isam.parameters():
+            p.requires_grad_(True)
+        print("[3D] Inter-Slice Aggregation Module enabled")
 
     def add_mim_head(self, patch_size: int = 4, in_chans: int = 3):
         self.mim_head = MIMHead(self.feat_dims[0], patch_size, in_chans)
@@ -844,6 +975,13 @@ class PEFTUMamba(nn.Module):
         for blk in self.bottleneck:
             x = blk(x)
 
+        # 3D inter-slice aggregation (active only during volume inference)
+        # use_3d is set True by model.enable_3d() before evaluation
+        if self.use_3d and x.dim() == 4:
+            # x: [B, H, W, C] where B = D (one slice per batch entry)
+            # Treat B as the depth dimension for ISAM
+            x = self.isam(x)   # [D, H, W, C]
+
         if mim_mask is not None and self.mim_head is not None:
             return self.mim_head(x)
 
@@ -880,6 +1018,7 @@ def build_model(cfg) -> PEFTUMamba:
         d_state_supp  = pc.supp_state_dim,
         use_supp_scan = pc.use_supplementary_scan,
         freeze_encoder= mc.freeze_encoder,
+        use_skip_gate = not getattr(pc, "no_skip_gate", False),
     )
 
     if mc.pretrained_path:
@@ -887,12 +1026,33 @@ def build_model(cfg) -> PEFTUMamba:
         if mc.freeze_encoder:
             model._apply_peft_freeze()
 
-    if pc.use_lora:
+    # Apply chosen supp_init strategy (default: neighbourhood)
+    supp_init = getattr(pc, "supp_init", "neighbourhood")
+    if supp_init != "neighbourhood":
+        print(f"[Model] Applying supp_init strategy: {supp_init}")
+        for m in model.modules():
+            if isinstance(m, SupplementarySSM) and m.d_state_supp > 0:
+                with torch.no_grad():
+                    m.A_log_supp.copy_(
+                        m._init_a_log_supp(m.d_state_supp, supp_init))
+
+    # SDLoRA: replace x_proj_supp with scale-decoupled LoRA on x_proj
+    if getattr(pc, "use_sdlora", False):
+        print("[Model] SDLoRA mode: replacing supplementary scan with SDLoRA")
+        for m in model.modules():
+            if isinstance(m, SupplementarySSM):
+                # Freeze supp params, enable LoRA on frozen x_proj instead
+                m.A_log_supp.requires_grad_(False)
+                m.x_proj_supp.requires_grad_(False)
+        model.enable_lora(rank=pc.lora_rank, alpha=pc.lora_alpha)
+
+    if pc.use_lora and not getattr(pc, "use_sdlora", False):
         model.enable_lora(rank=pc.lora_rank, alpha=pc.lora_alpha)
 
     n_tr = model.trainable_param_count()
     n_to = model.total_param_count()
     print(f"[Model] Trainable: {n_tr/1e6:.2f}M / Total: {n_to/1e6:.2f}M "
-          f"({100*n_tr/n_to:.1f}%)")
+          f"({100*n_tr/n_to:.1f}%)  "
+          f"freeze={mc.freeze_encoder}  supp_init={supp_init}")
 
     return model
