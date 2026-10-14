@@ -1,792 +1,477 @@
-"""
-models/model.py — PEFT-UMamba: Parameter-Efficient Medical Image Segmentation
-
-Architecture
-────────────
-  Encoder   : PatchEmbed → 4 × (VSSBlock × depth + PatchMerging)
-  Bottleneck: 2 × VSSBlock
-  Decoder   : 3 × (PatchExpanding + skip-cat + VSSBlock) + 2 × VSSBlock
-  Head      : FinalPatchExpanding (4×) → logits
-
-PEFT — Supplementary Scan
-──────────────────────────
-  Each VSS block's SS2D contains ONE shared SupplementarySSM.
-  The SSM expands the state dimension K → K + K′ via block-diagonal (A,B,C).
-  K frozen dims  : run through the mamba_ssm CUDA kernel (zero Python overhead).
-  K′ trainable   : run through _supp_scan_parallel() — fully vectorised
-                   log-space cumsum, no Python loop, O(1) kernel launches.
-  4-direction scan: all 4 directions are cat'd → [4B, L, C] and processed
-                   in a single forward call (4× GPU occupancy vs sequential).
-
-Performance highlights vs original
-────────────────────────────────────
-  • Python SSM loop eliminated  → ~120 Python loops/step → 0
-  • 4-direction batching        → 4× CUDA occupancy per block
-  • Volume cache in dataset.py  → NIfTI read once per worker, not per slice
-  • torch.compile + cudnn.bench → fused kernels for frozen encoder
-  • AMP (fp16/bf16) throughout  → fp32 only inside CUDA kernel, cast back
-"""
 
 import math
-from typing import List, Optional, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
     HAS_MAMBA_CUDA = True
-except ImportError:
+except ImportError:                                    # pragma: no cover
+    selective_scan_fn = None
     HAS_MAMBA_CUDA = False
 
 
 # =========================================================================== #
-#  Utility layers
+#  Selective scan (CUDA kernel, with a slow-but-correct reference fallback)
 # =========================================================================== #
 
-class LayerNorm2d(nn.Module):
-    """Channel-first LayerNorm for [B, C, H, W] tensors."""
-    def __init__(self, num_channels: int, eps: float = 1e-6):
+def _selective_scan_reference(u, delta, A, B, C, D=None, delta_bias=None,
+                              delta_softplus=True):
+    """
+    Exact sequential reference of Mamba's selective scan.
+      u, delta : [b, d, l]      A : [d, n]
+      B, C     : [b, g, n, l]   (g groups; d must be divisible by g)
+      D        : [d]
+    Returns y : [b, d, l].  Slow (Python loop over l) — only for CPU tests.
+    """
+    if delta_bias is not None:
+        delta = delta + delta_bias[None, :, None]
+    if delta_softplus:
+        delta = F.softplus(delta)
+    b, d, l = u.shape
+    g = B.shape[1]
+    B = B.repeat_interleave(d // g, dim=1)            # [b, d, n, l]
+    C = C.repeat_interleave(d // g, dim=1)
+    dA = torch.exp(delta.unsqueeze(2) * A[None, :, :, None])        # [b,d,n,l]
+    dBu = delta.unsqueeze(2) * B * u.unsqueeze(2)                   # [b,d,n,l]
+    h = u.new_zeros(b, d, A.shape[1])
+    ys = []
+    for t in range(l):
+        h = dA[..., t] * h + dBu[..., t]
+        ys.append((h * C[..., t]).sum(-1))
+    y = torch.stack(ys, dim=-1)
+    if D is not None:
+        y = y + D[None, :, None] * u
+    return y
+
+
+def selective_scan(u, delta, A, B, C, D, delta_bias, delta_softplus=True):
+    if HAS_MAMBA_CUDA and u.is_cuda:
+        return selective_scan_fn(u, delta, A, B, C, D, z=None,
+                                 delta_bias=delta_bias,
+                                 delta_softplus=delta_softplus,
+                                 return_last_state=False)
+    return _selective_scan_reference(u, delta, A, B, C, D, delta_bias,
+                                     delta_softplus)
+
+
+# =========================================================================== #
+#  Basic layers (names follow the original VMamba release)
+# =========================================================================== #
+
+class DropPath(nn.Module):
+    def __init__(self, p: float = 0.0):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias   = nn.Parameter(torch.zeros(num_channels))
-        self.eps    = eps
+        self.p = p
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        return self.weight[:, None, None] * x + self.bias[:, None, None]
+    def forward(self, x):
+        if self.p == 0.0 or not self.training:
+            return x
+        keep = 1 - self.p
+        mask = x.new_empty((x.shape[0],) + (1,) * (x.dim() - 1)).bernoulli_(keep)
+        return x * mask / keep
 
 
-class PatchEmbed(nn.Module):
-    """[B, 3, H, W] → [B, H/P, W/P, C]"""
-    def __init__(self, img_size: int = 224, patch_size: int = 4,
-                 in_chans: int = 3, embed_dim: int = 96):
+class PatchEmbed2D(nn.Module):
+    """[B,3,H,W] → [B,H/4,W/4,C]"""
+    def __init__(self, patch_size=4, in_chans=3, embed_dim=96):
         super().__init__()
-        self.proj = nn.Conv2d(in_chans, embed_dim,
-                              kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Conv2d(in_chans, embed_dim, patch_size, patch_size)
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x).permute(0, 2, 3, 1)   # [B, H/P, W/P, C]
-        return self.norm(x)
+    def forward(self, x):
+        return self.norm(self.proj(x).permute(0, 2, 3, 1))
 
 
-class PatchMerging(nn.Module):
-    """[B, H, W, C] → [B, H/2, W/2, 2C]"""
-    def __init__(self, dim: int, norm_layer=nn.LayerNorm):
+class PatchMerging2D(nn.Module):
+    """[B,H,W,C] → [B,H/2,W/2,2C]"""
+    def __init__(self, dim):
         super().__init__()
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm       = norm_layer(4 * dim)
+        self.norm = nn.LayerNorm(4 * dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = torch.cat([x[:, 0::2, 0::2], x[:, 1::2, 0::2],
                        x[:, 0::2, 1::2], x[:, 1::2, 1::2]], dim=-1)
         return self.reduction(self.norm(x))
 
 
-class PatchExpanding(nn.Module):
-    """[B, H, W, C] → [B, 2H, 2W, C/2]"""
-    def __init__(self, dim: int, norm_layer=nn.LayerNorm):
+class PatchExpand2D(nn.Module):
+    """[B,H,W,C] → [B,2H,2W,C/2]"""
+    def __init__(self, dim):
         super().__init__()
         self.expand = nn.Linear(dim, 2 * dim, bias=False)
-        self.norm   = norm_layer(dim // 2)
+        self.norm = nn.LayerNorm(dim // 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, H, W, C = x.shape
-        x = self.expand(x)
-        x = rearrange(x, "b h w (p1 p2 c) -> b (h p1) (w p2) c",
-                      p1=2, p2=2, c=C // 2)
+        x = self.expand(x).view(B, H, W, 2, 2, C // 2)
+        x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, 2 * H, 2 * W, C // 2)
         return self.norm(x)
 
 
-class FinalPatchExpanding(nn.Module):
-    """[B, H, W, C] → [B, num_classes, 4H, 4W]"""
-    def __init__(self, dim: int, num_classes: int,
-                 norm_layer=nn.LayerNorm):
+class FinalPatchExpand2D(nn.Module):
+    """[B,H/4,W/4,C] → [B,H,W,C]"""
+    def __init__(self, dim):
         super().__init__()
         self.expand = nn.Linear(dim, 16 * dim, bias=False)
-        self.norm   = norm_layer(dim)
-        self.head   = nn.Linear(dim, num_classes)
+        self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, H, W, C = x.shape
-        x = self.expand(x)
-        x = rearrange(x, "b h w (p1 p2 c) -> b (h p1) (w p2) c",
-                      p1=4, p2=4, c=C)
-        x = self.head(self.norm(x))             # [B, 4H, 4W, num_classes]
-        return x.permute(0, 3, 1, 2)            # [B, num_classes, 4H, 4W]
+        x = self.expand(x).view(B, H, W, 4, 4, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, 4 * H, 4 * W, C)
+        return self.norm(x)
 
 
 # =========================================================================== #
-#  SupplementarySSM
-#  ── the performance-critical class ─────────────────────────────────────────
-# =========================================================================== #
-
-class SupplementarySSM(nn.Module):
-    """
-    Mamba SSM with Supplementary Scan PEFT.
-
-    State dimension expanded K → K + K′:
-      • K  frozen dims  → mamba_ssm CUDA kernel (selective_scan_fn)
-      • K′ trainable    → _supp_scan_parallel() — vectorised log-cumsum,
-                          mathematically equivalent to sequential recurrence,
-                          zero Python loops, O(1) kernel launches for any L.
-
-    SS2D passes a [4B, L, C] batch so all 4 scan directions share one call.
-
-    AMP safety
-    ──────────
-    selective_scan_fn only accepts float32.  We save input_dtype, cast to
-    fp32 for the kernel, and restore input_dtype on the way out.  All linear
-    layers run in the caller's AMP dtype for speed.
-    """
-
-    def __init__(
-        self,
-        d_model:       int,
-        d_state:       int   = 16,
-        d_state_supp:  int   = 4,
-        d_conv:        int   = 4,
-        expand:        int   = 2,
-        dt_rank:       int   = -1,
-        dt_min:        float = 0.001,
-        dt_max:        float = 0.1,
-        dt_init_floor: float = 1e-4,
-        bias:          bool  = False,
-        conv_bias:     bool  = True,
-    ):
-        super().__init__()
-        self.d_model      = d_model
-        self.d_state      = d_state
-        self.d_state_supp = d_state_supp
-        self.d_inner      = int(expand * d_model)
-        self.dt_rank      = math.ceil(d_model / 16) if dt_rank <= 0 else dt_rank
-
-        # ── frozen pre-trained layers ─────────────────────────────────────────
-        self.in_proj  = nn.Linear(d_model, self.d_inner * 2, bias=bias)
-        self.conv1d   = nn.Conv1d(
-            self.d_inner, self.d_inner,
-            kernel_size=d_conv, groups=self.d_inner,
-            padding=d_conv - 1, bias=conv_bias,
-        )
-        self.x_proj   = nn.Linear(
-            self.d_inner, self.dt_rank + 2 * d_state, bias=False)
-        self.dt_proj  = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=bias)
-        self.out_norm = nn.LayerNorm(self.d_inner)
-
-        # A_log: log-space state matrix, shape [d_inner, d_state]
-        A = repeat(torch.arange(1, d_state + 1, dtype=torch.float32),
-                   "n -> d n", d=self.d_inner)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
-
-        # D: skip connection scale
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.D._no_weight_decay = True
-
-        # dt_proj bias init (Mamba standard)
-        dt = torch.exp(
-            torch.rand(self.d_inner) *
-            (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))
-        self.dt_proj.bias._no_weight_decay = True
-
-        # ── trainable supplementary parameters ────────────────────────────────
-        # x_proj_supp: generates B_supp, C_supp  (2·K′ values per token)
-        self.x_proj_supp = nn.Linear(
-            self.d_inner, 2 * d_state_supp, bias=False)
-        nn.init.xavier_uniform_(self.x_proj_supp.weight)
-
-        # A_log_supp: Neighbourhood Initialization from boundary of frozen A
-        self.A_log_supp = nn.Parameter(self._neighbourhood_init(d_state_supp))
-
-    # ── Neighbourhood Initialization ─────────────────────────────────────────
-
-    def _neighbourhood_init(self, K_prime: int) -> torch.Tensor:
-        """
-        Initialise A_supp near the last frozen dimension.
-        Provides a semantically-aligned warm start so the supplementary
-        dimensions can immediately learn from high-level features.
-        """
-        boundary = float(self.d_state)   # S4D: |A[*, K-1]| = K
-        noise    = torch.randn(self.d_inner, K_prime).abs() * 1e-6
-        return torch.log(
-            (torch.full((self.d_inner, K_prime), boundary) + noise)
-            .clamp(min=1e-8)
-        )
-
-    # ── SSM scan implementations ──────────────────────────────────────────────
-
-    @staticmethod
-    def _scan_cuda(x, dt, A, B, C, D_vec):
-        """Wrapper around mamba_ssm selective_scan_fn for cleaner call sites."""
-        return selective_scan_fn(
-            x, dt, A,
-            B.transpose(1, 2),   # [B, K, L]
-            C.transpose(1, 2),   # [B, K, L]
-            D_vec,
-            z=None, delta_bias=None,
-            delta_softplus=False,
-            return_last_state=False,
-        ).transpose(1, 2)        # [B, L, D]
-
-    @staticmethod
-    def _scan_fast(
-        x:  torch.Tensor,   # [B, D, L]  fp32
-        dt: torch.Tensor,   # [B, D, L]  fp32
-        A:  torch.Tensor,   # [D, K]     fp32  (negative)
-        B:  torch.Tensor,   # [B, L, K]  fp32
-        C:  torch.Tensor,   # [B, L, K]  fp32
-        D_vec: Optional[torch.Tensor] = None,  # [D]
-    ) -> torch.Tensor:
-        """
-        Fully vectorised diagonal SSM scan — ZERO Python loops.
-
-        Uses the Heinsen / log-space prefix-product formulation but with
-        a numerically stable normalisation that avoids overflow:
-
-          For each step t, define:
-            log_a[t] = dt[t] * A    (always ≤ 0 since A < 0, dt > 0)
-            beta[t]  = dt[t] * B[t] * x[t]
-
-          The hidden state:
-            h[t] = sum_{s≤t} beta[s] * exp(sum_{u=s+1}^{t} log_a[u])
-
-          Written as a scan:
-            prefix_loga[t] = cumsum(log_a)[t]                (always ≤ 0)
-            h[t] = exp(prefix_loga[t]) *
-                   cumsum(beta * exp(-prefix_loga_shifted))
-
-          exp(prefix_loga) ∈ (0,1] always (A<0, dt>0 → log_a≤0).
-          exp(-prefix_loga_shifted) could blow up if prefix_loga_shifted
-          is very negative (large t).
-
-        Numerically safe version:
-          Normalise by the RUNNING maximum of prefix_loga_shifted so all
-          exponents stay in (−∞, 0]:
-
-            m[t]      = max_{s≤t}(−prefix_loga[s−1])   (running max, ≥ 0)
-            scaled[t] = beta[t] * exp(−prefix_loga[t−1] − m[t])
-            h[t]      = exp(prefix_loga[t] + m[t]) * cumsum(scaled)[t]
-
-          exp(prefix_loga[t] + m[t]) and exp(−prefix_loga[t−1] − m[t])
-          are both ≤ exp(0) = 1, so no overflow regardless of L.
-
-        Memory: O(B × D × K × L) — same as the sequential scan.
-        Speed:  CUDA kernel launches only, no Python loop.
-
-        Returns [B, L, D].
-        """
-        B_b, D_dim, L = x.shape
-        K = A.shape[1]
-
-        # log_a: [B, D, L, K]  — always ≤ 0
-        log_a = dt.unsqueeze(-1) * A[None, :, None, :]     # [B,D,L,K]
-
-        # beta: [B, D, L, K]
-        beta  = (dt * x).unsqueeze(-1) * B.unsqueeze(1)    # [B,D,L,K]
-
-        # prefix sum of log_a along L → [B, D, L, K], always ≤ 0
-        cum_la = torch.cumsum(log_a, dim=2)                 # [B,D,L,K]
-
-        # shifted: cum_la at t−1  (0 at t=0)
-        cum_la_prev = F.pad(cum_la[:, :, :-1, :], (0, 0, 1, 0))  # [B,D,L,K]
-
-        # Running max of −cum_la_prev for numerical stability
-        neg_prev  = -cum_la_prev                            # ≥ 0
-        run_max   = torch.cummax(neg_prev, dim=2).values    # [B,D,L,K]
-
-        # Scaled betas: exp(−cum_la_prev − run_max) ∈ (0,1]
-        scaled   = beta * torch.exp(-cum_la_prev - run_max) # [B,D,L,K]
-        cum_beta = torch.cumsum(scaled, dim=2)              # [B,D,L,K]
-
-        # Hidden state: exp(cum_la + run_max) * cum_beta
-        h = torch.exp(cum_la + run_max) * cum_beta          # [B,D,L,K]
-
-        # Output: contract over K  →  [B, D, L]
-        y = (h * C.unsqueeze(1)).sum(-1)                    # [B,D,L]
-
-        if D_vec is not None:
-            y = y + D_vec[None, :, None] * x               # skip connection
-
-        return y.transpose(1, 2)                            # [B, L, D]
-
-    # ── forward ──────────────────────────────────────────────────────────────
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x : [B, L, d_model]  — any dtype (fp16/bf16/fp32 under AMP)
-        Returns [B, L, d_model] in the same dtype.
-        """
-        dtype = x.dtype
-        B, L, _ = x.shape
-
-        # Shared input projection
-        xz      = self.in_proj(x)
-        x_in, z = xz.chunk(2, dim=-1)           # each [B, L, d_inner]
-
-        # Depthwise causal conv → [B, d_inner, L]
-        x_in = F.silu(self.conv1d(x_in.transpose(1, 2))[..., :L])
-
-        # Frozen projection
-        xp             = self.x_proj(x_in.transpose(1, 2))
-        dt_raw, Bf, Cf = torch.split(
-            xp, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt   = F.softplus(self.dt_proj(dt_raw))  # [B, L, d_inner]
-        dt_t = dt.float().transpose(1, 2)         # [B, d_inner, L]
-
-        # Supplementary projection
-        xp_s    = self.x_proj_supp(x_in.transpose(1, 2))
-        Bs, Cs  = xp_s.chunk(2, dim=-1)          # each [B, L, K′]
-
-        A_frz = -torch.exp(self.A_log.float())    # [d_inner, K]
-        A_sup = -torch.exp(self.A_log_supp.float())  # [d_inner, K′]
-
-        # Zero vector for D in supplementary path (no skip connection)
-        D_zero = x_in.new_zeros(self.d_inner)
-
-        if HAS_MAMBA_CUDA:
-            # ── Fast path: CUDA kernel for both paths ─────────────────────────
-            y_frz = self._scan_cuda(
-                x_in.float(), dt_t, A_frz,
-                Bf.float(), Cf.float(), self.D.float(),
-            ).to(dtype)
-            y_sup = self._scan_cuda(
-                x_in.float(), dt_t, A_sup,
-                Bs.float(), Cs.float(), D_zero.float(),
-            ).to(dtype)
-        else:
-            # ── Fallback: vectorised scan, zero Python loops ───────────────────
-            y_frz = self._scan_fast(
-                x_in.float(), dt_t, A_frz,
-                Bf.float(), Cf.float(), self.D.float(),
-            ).to(dtype)
-            y_sup = self._scan_fast(
-                x_in.float(), dt_t, A_sup,
-                Bs.float(), Cs.float(), None,
-            ).to(dtype)
-
-        # Combine, norm in fp32, gate, project
-        y = y_frz + y_sup
-        y = self.out_norm(y.float()).to(dtype)
-        y = y * F.silu(z)
-        return self.out_proj(y)
-
-    def freeze_pretrained(self):
-        """Freeze all parameters except A_log_supp and x_proj_supp."""
-        for name, p in self.named_parameters():
-            if "supp" not in name:
-                p.requires_grad_(False)
-
-
-# =========================================================================== #
-#  SS2D — batched 4-direction selective scan
-#  ── one SSM call for all 4 directions (4× GPU occupancy) ──────────────────
+#  SS2D with Supplementary Scan  (§3.3–3.5)
 # =========================================================================== #
 
 class SS2D(nn.Module):
     """
-    2-D Selective Scan (SS2D) with Supplementary Scan PEFT.
+    VMamba SS2D (4 scan directions, per-direction frozen x/Δ projections and
+    A, D), extended with K′ supplementary state dimensions.
 
-    A single shared SupplementarySSM processes all 4 scan directions in one
-    forward call by expanding the batch dim:  [B,L,C] → [4B,L,C] → SSM →
-    split back and un-permute.  Parameter count is identical to 4 separate
-    SSMs; CUDA utilisation is 4× higher.
+    Supplementary parameters (trainable):
+      x_proj_supp  [2K′, d_inner]  → B_supp (first K′ rows), C_supp (last K′)
+      A_logs_supp  [d_inner, K′]
+    They are shared across the four scan directions (0.17M in total for the
+    network at K′=4), use the frozen Δ_t of each direction (Eq. 10) and the
+    same input x_t (shared input projection, §3.7).
     """
 
-    def __init__(self, d_model: int, d_state: int = 16,
-                 d_state_supp: int = 4, **kwargs):
+    K_DIRS = 4
+
+    def __init__(self, d_model, d_state=16, d_state_supp=0, d_conv=3,
+                 expand=2.0, dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+                 bias=False, conv_bias=True, ni_noise_std=1e-6):
         super().__init__()
-        self.ssm  = SupplementarySSM(d_model, d_state=d_state,
-                                     d_state_supp=d_state_supp, **kwargs)
-        self.norm = nn.LayerNorm(d_model)
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_state_supp = d_state_supp
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = math.ceil(d_model / 16)
+        self.ni_noise_std = ni_noise_std
+        K, D, N, R = self.K_DIRS, self.d_inner, d_state, self.dt_rank
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, H, W, C]"""
-        B, H, W, C = x.shape
-        L = H * W
+        # ── frozen (pretrained) parameters — VMamba naming ────────────────────
+        self.in_proj = nn.Linear(d_model, 2 * D, bias=bias)
+        self.conv2d = nn.Conv2d(D, D, d_conv, padding=(d_conv - 1) // 2,
+                                groups=D, bias=conv_bias)
+        self.act = nn.SiLU()
 
-        # Build 4 scan sequences without allocation via views/permutes
-        # dir 0 : row-major   →   [B, HW, C]
-        # dir 1 : col-major   ↓   [B, WH, C]
-        # dir 2 : row-major   ←   (flip H first)
-        # dir 3 : col-major   ↑   (flip W, then col-major)
-        x0 = x.reshape(B, L, C)
-        x1 = x.permute(0, 2, 1, 3).reshape(B, L, C)
-        x2 = x.flip(1).reshape(B, L, C)
-        x3 = x.flip(2).permute(0, 2, 1, 3).reshape(B, L, C)
+        self.x_proj_weight = nn.Parameter(torch.empty(K, R + 2 * N, D))
+        nn.init.uniform_(self.x_proj_weight, -D ** -0.5, D ** -0.5)
 
-        # Single batched call:  [4B, L, C] → [4B, L, C]
-        out = self.ssm(torch.cat([x0, x1, x2, x3], dim=0))
+        dt_std = R ** -0.5
+        self.dt_projs_weight = nn.Parameter(
+            torch.empty(K, D, R).uniform_(-dt_std, dt_std))
+        dt = torch.exp(torch.rand(K, D) * (math.log(dt_max) - math.log(dt_min))
+                       + math.log(dt_min)).clamp(min=dt_init_floor)
+        self.dt_projs_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
 
-        # Split and un-permute
-        o0, o1, o2, o3 = out.chunk(4, dim=0)
-        r0 = o0.reshape(B, H, W, C)
-        r1 = o1.reshape(B, W, H, C).permute(0, 2, 1, 3)
-        r2 = o2.reshape(B, H, W, C).flip(1)
-        r3 = o3.reshape(B, W, H, C).permute(0, 2, 1, 3).flip(2)
+        A = torch.arange(1, N + 1, dtype=torch.float32).repeat(K * D, 1)
+        self.A_logs = nn.Parameter(torch.log(A))           # [K·D, N]
+        self.Ds = nn.Parameter(torch.ones(K * D))          # [K·D]
+        self.out_norm = nn.LayerNorm(D)
+        self.out_proj = nn.Linear(D, d_model, bias=bias)
 
-        return self.norm((r0 + r1 + r2 + r3) * 0.25)
+        # ── supplementary (trainable) parameters ──────────────────────────────
+        if d_state_supp > 0:
+            self.x_proj_supp = nn.Parameter(torch.zeros(2 * d_state_supp, D))
+            self.A_logs_supp = nn.Parameter(torch.zeros(D, d_state_supp))
+            self.reset_supplementary("neighbourhood")
 
-    def freeze_pretrained(self):
-        self.ssm.freeze_pretrained()
+    # ── initialisation of the supplementary state (§3.5) ──────────────────────
+    @torch.no_grad()
+    def reset_supplementary(self, strategy: str = "neighbourhood"):
+        """
+        neighbourhood : A_supp^(j) = A_frz^(K) + ε^(j), ε ~ N(0, σ²)  (Eq. 11)
+                        A_frz^(K) = learned value of the last frozen state
+                        dimension (averaged over the 4 scan directions).
+                        Must be called AFTER the pretrained weights are loaded.
+        s4d           : A_supp^(j) = −(K + j)   (standard S4D continuation;
+                        used for the "w/o Neighbourhood Init" ablation)
+        B_supp : Xavier uniform.   C_supp : 0  → zero contribution at init.
+        """
+        if self.d_state_supp == 0:
+            return
+        Kp, D, N = self.d_state_supp, self.d_inner, self.d_state
+        if strategy == "neighbourhood":
+            A_frz = -torch.exp(self.A_logs.float()).view(self.K_DIRS, D, N)
+            anchor = A_frz[:, :, N - 1].mean(0)                       # [D]
+            A_sup = anchor[:, None] + torch.randn(D, Kp) * self.ni_noise_std
+            A_sup = A_sup.clamp(max=-1e-4)                            # keep A<0
+            self.A_logs_supp.copy_(torch.log(-A_sup))
+        elif strategy == "s4d":
+            A_sup = torch.arange(N + 1, N + Kp + 1, dtype=torch.float32)
+            self.A_logs_supp.copy_(torch.log(A_sup).repeat(D, 1))
+        else:
+            raise ValueError(f"unknown supplementary init: {strategy}")
+        self.x_proj_supp.zero_()
+        nn.init.xavier_uniform_(self.x_proj_supp[:Kp])                # B_supp
+        # rows Kp: (C_supp) stay exactly zero
 
+    # ── forward ──────────────────────────────────────────────────────────────
+    def forward(self, x: torch.Tensor) -> torch.Tensor:          # [B,H,W,C]
+        B, H, W, _ = x.shape
+        xz = self.in_proj(x)
+        x_in, z = xz.chunk(2, dim=-1)
+        x_in = self.act(self.conv2d(x_in.permute(0, 3, 1, 2).contiguous()))
+        y = self._forward_core(x_in)                              # [B,H,W,D]
+        y = self.out_norm(y)
+        y = y * F.silu(z)
+        return self.out_proj(y)
 
-# =========================================================================== #
-#  VSSBlock
-# =========================================================================== #
+    def _forward_core(self, x: torch.Tensor) -> torch.Tensor:    # [B,D,H,W]
+        B, D, H, W = x.shape
+        L, K, N, Kp = H * W, self.K_DIRS, self.d_state, self.d_state_supp
+
+        x_hwwh = torch.stack([x.view(B, -1, L),
+                              x.transpose(2, 3).contiguous().view(B, -1, L)],
+                             dim=1)                                # [B,2,D,L]
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # [B,4,D,L]
+
+        x_dbl = torch.einsum("bkdl,kcd->bkcl", xs, self.x_proj_weight)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, N, N], dim=2)
+        dts = torch.einsum("bkrl,kdr->bkdl", dts, self.dt_projs_weight)
+        As = -torch.exp(self.A_logs.float())                      # [K·D, N]
+
+        if Kp > 0:   # block-diagonal expansion K → K+K′ (Eq. 5)
+            sup = torch.einsum("bkdl,cd->bkcl", xs, self.x_proj_supp)
+            B_sup, C_sup = sup.split([Kp, Kp], dim=2)
+            Bs = torch.cat([Bs, B_sup], dim=2)
+            Cs = torch.cat([Cs, C_sup], dim=2)
+            A_sup = -torch.exp(self.A_logs_supp.float()).repeat(K, 1)  # [K·D,K′]
+            As = torch.cat([As, A_sup], dim=1)                     # [K·D,N+K′]
+
+        out = selective_scan(
+            xs.float().reshape(B, -1, L),
+            dts.float().reshape(B, -1, L),
+            As.contiguous(),
+            Bs.float().contiguous(), Cs.float().contiguous(),
+            self.Ds.float(),
+            delta_bias=self.dt_projs_bias.float().view(-1),
+            delta_softplus=True,
+        ).view(B, K, -1, L)
+
+        inv = torch.flip(out[:, 2:4], dims=[-1])
+        wh = out[:, 1].view(B, -1, W, H).transpose(2, 3).reshape(B, -1, L)
+        invwh = inv[:, 1].view(B, -1, W, H).transpose(2, 3).reshape(B, -1, L)
+        y = out[:, 0] + inv[:, 0] + wh + invwh                     # [B,D,L]
+        return y.transpose(1, 2).reshape(B, H, W, -1).to(x.dtype)
+
 
 class VSSBlock(nn.Module):
-    """
-    Visual State Space Block following Mamba-UNet paper exactly.
-
-    Paper quote: "This VSS block eschews positional embedding, unlike typical
-    vision transformers, opting for a streamlined structure sans the MLP phase,
-    enabling a denser stack of blocks within the same depth budget."
-
-    Structure: LN → SS2D → residual  (no MLP)
-
-    The MLP is kept as an option (use_mlp=True) for ablation but is OFF
-    by default to match the paper.
-    """
-
-    def __init__(self, dim: int, d_state: int = 16, d_state_supp: int = 4,
-                 mlp_ratio: float = 4.0, drop: float = 0.0,
-                 use_supp_scan: bool = True, use_mlp: bool = False, **kwargs):
+    """LN → SS2D → residual (VMamba-Tiny v0 block, no MLP)."""
+    def __init__(self, dim, d_state=16, d_state_supp=0, drop_path=0.0):
         super().__init__()
-        self.norm1   = nn.LayerNorm(dim)
-        self.ss2d    = SS2D(dim,
-                            d_state=d_state,
-                            d_state_supp=d_state_supp if use_supp_scan else 0,
-                            **kwargs)
-        self.use_mlp = use_mlp
-        if use_mlp:
-            self.norm2 = nn.LayerNorm(dim)
-            hidden     = int(dim * mlp_ratio)
-            self.mlp   = nn.Sequential(
-                nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(drop),
-                nn.Linear(hidden, dim), nn.Dropout(drop),
-            )
+        self.ln_1 = nn.LayerNorm(dim, eps=1e-6)
+        self.self_attention = SS2D(dim, d_state=d_state,
+                                   d_state_supp=d_state_supp)
+        self.drop_path = DropPath(drop_path)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, W, C]
-        x = x + self.ss2d(self.norm1(x))
-        if self.use_mlp:
-            B, H, W, C = x.shape
-            flat = x.view(B, H * W, C)
-            x    = (flat + self.mlp(self.norm2(flat))).view(B, H, W, C)
-        return x
-
-    def freeze_pretrained(self):
-        self.ss2d.freeze_pretrained()
-        for p in self.norm1.parameters(): p.requires_grad_(False)
-        if self.use_mlp:
-            for p in self.norm2.parameters(): p.requires_grad_(False)
-            for p in self.mlp.parameters():   p.requires_grad_(False)
+    def forward(self, x):
+        return x + self.drop_path(self.self_attention(self.ln_1(x)))
 
 
 # =========================================================================== #
-#  Encoder / Decoder stages
+#  Encoder (§3.2)
 # =========================================================================== #
 
-class EncoderStage(nn.Module):
-    def __init__(self, dim: int, depth: int, d_state: int = 16,
-                 d_state_supp: int = 4, downsample=None,
-                 use_supp_scan: bool = True):
+class EncoderLayer(nn.Module):
+    def __init__(self, dim, depth, d_state, d_state_supp, downsample: bool):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            VSSBlock(dim, d_state=d_state, d_state_supp=d_state_supp,
-                     use_supp_scan=use_supp_scan, use_mlp=False)
-            for _ in range(depth)
-        ])
-        self.downsample = downsample
+        self.blocks = nn.ModuleList(
+            VSSBlock(dim, d_state, d_state_supp) for _ in range(depth))
+        self.downsample = PatchMerging2D(dim) if downsample else None
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        for blk in self.blocks:
-            x = blk(x)
-        skip = x
-        if self.downsample is not None:
-            x = self.downsample(x)
-        return x, skip
 
-    def freeze_pretrained(self):
-        for blk in self.blocks:
-            blk.freeze_pretrained()
+class VMambaEncoder(nn.Module):
+    """Returns the four stage features (before down-sampling) for skips."""
+    def __init__(self, depths=(2, 2, 9, 2), dims=(96, 192, 384, 768),
+                 d_state=16, d_state_supp=4):
+        super().__init__()
+        self.patch_embed = PatchEmbed2D(4, 3, dims[0])
+        self.layers = nn.ModuleList(
+            EncoderLayer(dims[i], depths[i], d_state, d_state_supp,
+                         downsample=(i < len(depths) - 1))
+            for i in range(len(depths)))
+
+    def forward(self, x) -> List[torch.Tensor]:
+        x = self.patch_embed(x)
+        feats = []
+        for layer in self.layers:
+            for blk in layer.blocks:
+                x = blk(x)
+            feats.append(x)
+            if layer.downsample is not None:
+                x = layer.downsample(x)
+        return feats            # [H/4,96], [H/8,192], [H/16,384], [H/32,768]
+
+
+# =========================================================================== #
+#  SCAM (§3.6.1), Skip Attention Gate (Oktay et al.), decoder (§3.6)
+# =========================================================================== #
+
+class SCAM(nn.Module):
+    """
+    Sequential Context Aggregation Module.
+    Bottleneck features of an ordered sequence (adjacent slices / frames)
+    are pooled, projected to a small hidden size and passed through a
+    bidirectional GRU; f̃_t = →h_t + ←h_t (Eq. 12) is projected back and
+    added to every spatial position.  The output projection is zero-initialised
+    so SCAM starts as an identity mapping.
+
+    ordered=True : the whole batch is ONE ordered sequence (the loader must
+                   provide consecutive slices/frames in order).
+    ordered=False: every sample is a length-1 sequence (unordered images).
+    """
+    def __init__(self, dim=768, hidden=64):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.down = nn.Linear(dim, hidden)
+        self.gru = nn.GRU(hidden, hidden, batch_first=True, bidirectional=True)
+        self.up = nn.Linear(hidden, dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, f: torch.Tensor, ordered: bool) -> torch.Tensor:
+        B = f.shape[0]
+        v = self.down(self.norm(f.mean(dim=(1, 2))))               # [B,h]
+        seq = v.unsqueeze(0) if ordered else v.unsqueeze(1)         # [1,B,h] | [B,1,h]
+        out, _ = self.gru(seq.float())
+        fwd, bwd = out.chunk(2, dim=-1)
+        ctx = (fwd + bwd).reshape(B, -1).to(f.dtype)               # Eq. 12
+        return f + self.up(ctx)[:, None, None, :]
 
 
 class SkipAttentionGate(nn.Module):
-    """
-    Channel-wise SE attention on skip connections.
-    Bridges the domain gap: encoder features are natural-image pretrained,
-    decoder expects MRI features. Gate suppresses irrelevant channels.
-    Lightweight: 2 Linear layers, negligible parameter cost.
-    """
-    def __init__(self, dim: int, reduction: int = 4):
+    """Additive attention gate (Oktay et al., 2018):
+       α = σ(ψ(ReLU(W_x x + W_g g))),  output = α ⊙ x"""
+    def __init__(self, skip_dim, gate_dim, inter_dim=None):
         super().__init__()
-        hidden = max(dim // reduction, 16)
-        self.gate = nn.Sequential(
-            nn.Linear(dim, hidden, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden, dim, bias=False),
-            nn.Sigmoid(),
-        )
-        self.norm = nn.LayerNorm(dim)
+        inter = inter_dim or max(skip_dim // 2, 16)
+        self.W_x = nn.Linear(skip_dim, inter, bias=False)
+        self.W_g = nn.Linear(gate_dim, inter, bias=True)
+        self.psi = nn.Linear(inter, 1, bias=True)
 
-    def forward(self, skip: torch.Tensor) -> torch.Tensor:
-        # skip: [B, H, W, C]
-        avg = skip.mean(dim=(1, 2))                  # [B, C] global avg pool
-        w   = self.gate(avg).unsqueeze(1).unsqueeze(1)  # [B, 1, 1, C]
-        return self.norm(skip * w)
+    def forward(self, x, g):                                      # channel-last
+        alpha = torch.sigmoid(self.psi(F.relu(self.W_x(x) + self.W_g(g))))
+        return x * alpha
 
 
-class DecoderConvBlock(nn.Module):
-    """
-    Depthwise-separable conv block for decoder feature refinement.
-
-    WHY conv instead of VSSBlock here:
-      The decoder VSSBlocks in the original design have randomly-initialised
-      SSM weights (only the encoder was VMamba-pretrained).  Training SSMs
-      from scratch requires many iterations to stabilise.  A simple conv block
-      with residual connection converges faster and gives better Dice in the
-      first 50-100 epochs.  The PEFT Supplementary Scan is applied in the
-      ENCODER (frozen backbone); the decoder refines with conv.
-    """
-    def __init__(self, dim: int):
+class DecoderLayer(nn.Module):
+    def __init__(self, in_dim, skip_dim, depth, d_state, d_state_supp,
+                 use_gate=True):
         super().__init__()
-        self.dw  = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
-        self.pw  = nn.Conv2d(dim, dim, 1, bias=False)
-        self.bn  = nn.BatchNorm2d(dim)
-        self.act = nn.GELU()
-        self.ln  = nn.LayerNorm(dim)
+        out_dim = in_dim // 2
+        self.upsample = PatchExpand2D(in_dim)
+        self.gate = SkipAttentionGate(skip_dim, out_dim) if use_gate else None
+        self.concat_proj = nn.Linear(out_dim + skip_dim, out_dim, bias=False)
+        self.blocks = nn.ModuleList(
+            VSSBlock(out_dim, d_state, d_state_supp) for _ in range(depth))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, W, C]  channel-last
-        B, H, W, C = x.shape
-        res = x
-        x   = x.permute(0, 3, 1, 2).contiguous()    # [B, C, H, W]
-        x   = self.act(self.bn(self.pw(self.dw(x))))
-        x   = x.permute(0, 2, 3, 1).contiguous()    # [B, H, W, C]
-        return self.ln(x + res)
-
-
-class DeepSupHead(nn.Module):
-    """Auxiliary segmentation head for deep supervision at each decoder stage."""
-    def __init__(self, in_dim: int, num_classes: int, scale_factor: int):
-        super().__init__()
-        self.conv  = nn.Conv2d(in_dim, num_classes, 1)
-        self.scale = scale_factor
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, W, C]
-        x = x.permute(0, 3, 1, 2).contiguous()      # [B, C, H, W]
-        x = F.interpolate(x, scale_factor=self.scale,
-                          mode="bilinear", align_corners=False)
-        return self.conv(x)                           # [B, num_classes, H_full, W_full]
-
-
-class DecoderStage(nn.Module):
-    """
-    Improved decoder stage for AMOS MRI segmentation.
-
-    Changes vs original:
-      1. SkipAttentionGate on the encoder skip — suppresses natural-image
-         patterns irrelevant to MRI organs.
-      2. DecoderConvBlock instead of VSSBlock — avoids training SSMs from
-         random init, converges faster in first 150 epochs.
-      3. Optional deep supervision head (attached externally by PEFTUMamba).
-    """
-    def __init__(self, dim: int, skip_dim: int, depth: int = 2,
-                 d_state: int = 16, d_state_supp: int = 4,
-                 use_supp_scan: bool = True):
-        super().__init__()
-        out_dim       = dim // 2
-        self.upsample = PatchExpanding(dim)
-        self.skip_gate = SkipAttentionGate(skip_dim)
-        self.proj     = nn.Linear(out_dim + skip_dim, out_dim, bias=False)
-        self.norm     = nn.LayerNorm(out_dim)
-        # Conv blocks for feature refinement (faster convergence than SSM from scratch)
-        self.blocks   = nn.ModuleList([
-            DecoderConvBlock(out_dim) for _ in range(depth)
-        ])
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x    = self.upsample(x)                           # [B, 2H, 2W, C/2]
-        skip = self.skip_gate(skip)                       # domain-adapted skip
-        assert x.shape[1:3] == skip.shape[1:3], (
-            f"Spatial mismatch: {x.shape[1:3]} vs {skip.shape[1:3]}")
-        x = self.norm(self.proj(torch.cat([x, skip], dim=-1)))
+    def forward(self, x, skip):
+        x = self.upsample(x)
+        if self.gate is not None:
+            skip = self.gate(skip, x)
+        x = self.concat_proj(torch.cat([x, skip], dim=-1))
         for blk in self.blocks:
             x = blk(x)
         return x
 
 
-# =========================================================================== #
-#  Auxiliary heads
-# =========================================================================== #
-
-class MIMHead(nn.Module):
-    """Pixel-reconstruction head for self-supervised MIM stage."""
-    def __init__(self, embed_dim: int, patch_size: int = 4, in_chans: int = 3):
+class AuxHead(nn.Module):
+    def __init__(self, dim, num_classes, scale):
         super().__init__()
-        self.pred = nn.Linear(embed_dim, patch_size * patch_size * in_chans)
+        self.proj = nn.Conv2d(dim, num_classes, 1)
+        self.scale = scale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pred(x)     # [B, H', W', P²·3]
+    def forward(self, x):
+        x = self.proj(x.permute(0, 3, 1, 2).contiguous())
+        return F.interpolate(x, scale_factor=self.scale, mode="bilinear",
+                             align_corners=False)
 
+
+# =========================================================================== #
+#  LoRA (Table 6 baseline)
+# =========================================================================== #
 
 class LoRALinear(nn.Module):
-    """Low-Rank Adaptation wrapper — used during MIM adaptation stage only."""
-    def __init__(self, linear: nn.Linear, rank: int = 4,
-                 alpha: float = 8.0, dropout: float = 0.0):
+    def __init__(self, linear: nn.Linear, rank=4, alpha=8.0):
         super().__init__()
         self.linear = linear
-        self.linear.weight.requires_grad_(False)
-        if linear.bias is not None:
-            linear.bias.requires_grad_(False)
+        for p in self.linear.parameters():
+            p.requires_grad_(False)
         self.scale = alpha / rank
-        d_out, d_in = linear.weight.shape
-        self.lora_A = nn.Parameter(torch.randn(rank, d_in) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
-        self.drop   = nn.Dropout(dropout)
+        self.lora_A = nn.Parameter(torch.randn(rank, linear.in_features) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(linear.out_features, rank))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x) + self.scale * (
-            self.drop(x) @ self.lora_A.T @ self.lora_B.T)
+    def forward(self, x):
+        return self.linear(x) + self.scale * (x @ self.lora_A.T @ self.lora_B.T)
 
 
 # =========================================================================== #
-#  PEFTUMamba — full model
+#  PEFT-UMamba
 # =========================================================================== #
 
 class PEFTUMamba(nn.Module):
-    """
-    PEFT-UMamba full segmentation network.
-
-    Encoder spatial resolution at img_size=224 (patch_size=4):
-      Stage 0: [B, 56, 56,  96]  skip0
-      Stage 1: [B, 28, 28, 192]  skip1
-      Stage 2: [B, 14, 14, 384]  skip2
-      Stage 3: [B,  7,  7, 768]  (no downsample)
-    Bottleneck: [B, 7, 7, 768]
-    Decoder:
-      Dec 0: 768→384, cat skip2[384] → [B, 14, 14, 384]
-      Dec 1: 384→192, cat skip1[192] → [B, 28, 28, 192]
-      Dec 2: 192→96,  cat skip0[ 96] → [B, 56, 56,  96]
-    Final refinement + 4× head → [B, num_classes, 224, 224]
-    """
-
-    def __init__(
-        self,
-        img_size:      int        = 224,
-        in_channels:   int        = 3,
-        num_classes:   int        = 9,
-        depths:        List[int]  = None,
-        feat_dims:     List[int]  = None,
-        d_state:       int        = 16,
-        d_state_supp:  int        = 4,
-        use_supp_scan: bool       = True,
-        freeze_encoder: bool      = True,
-    ):
+    def __init__(self, num_classes, depths=(2, 2, 9, 2),
+                 dims=(96, 192, 384, 768), d_state=16, d_state_supp=4,
+                 decoder_depth=2, use_scam=True, scam_hidden=64,
+                 use_skip_gate=True, scam_ordered=False):
         super().__init__()
-        depths    = depths    or [2, 2, 9, 2]
-        feat_dims = feat_dims or [96, 192, 384, 768]
-        assert len(depths) == len(feat_dims) == 4
-
         self.num_classes = num_classes
-        self.feat_dims   = feat_dims
+        self.dims = dims
+        self.scam_ordered = scam_ordered
 
-        # ── Encoder ──────────────────────────────────────────────────────────
-        self.patch_embed    = PatchEmbed(img_size, 4, in_channels, feat_dims[0])
-        self.encoder_stages = nn.ModuleList()
-        for i in range(4):
-            self.encoder_stages.append(EncoderStage(
-                dim=feat_dims[i],
-                depth=depths[i],
-                d_state=d_state,
-                d_state_supp=d_state_supp,
-                downsample=PatchMerging(feat_dims[i]) if i < 3 else None,
-                use_supp_scan=use_supp_scan,
-            ))
+        self.encoder = VMambaEncoder(depths, dims, d_state, d_state_supp)
+        self.scam = SCAM(dims[-1], scam_hidden) if use_scam else None
 
-        # ── Bottleneck ───────────────────────────────────────────────────────
-        self.bottleneck = nn.ModuleList([
-            VSSBlock(feat_dims[-1], d_state=d_state,
-                     d_state_supp=d_state_supp,
-                     use_supp_scan=use_supp_scan, use_mlp=False)
-            for _ in range(2)
+        self.decoder = nn.ModuleList(
+            DecoderLayer(dims[i], dims[i - 1], decoder_depth, d_state,
+                         d_state_supp, use_gate=use_skip_gate)
+            for i in (3, 2, 1))                       # 768→384→192→96
+        self.aux_heads = nn.ModuleList([              # deepest → shallowest
+            AuxHead(dims[2], num_classes, 16),
+            AuxHead(dims[1], num_classes, 8),
+            AuxHead(dims[0], num_classes, 4),
         ])
+        self.final_expand = FinalPatchExpand2D(dims[0])
+        self.head = nn.Linear(dims[0], num_classes)
 
-        # ── Decoder ──────────────────────────────────────────────────────────
-        # Shape trace (in_dim → after_upsample + skip → out_dim):
-        #   Dec0: 768 → 384 + 384 → 384
-        #   Dec1: 384 → 192 + 192 → 192
-        #   Dec2: 192 →  96 +  96 →  96
-        self.decoder_stages = nn.ModuleList()
-        for in_dim, skip_dim in [
-            (feat_dims[3], feat_dims[2]),
-            (feat_dims[2], feat_dims[1]),
-            (feat_dims[1], feat_dims[0]),
-        ]:
-            self.decoder_stages.append(DecoderStage(
-                dim=in_dim, skip_dim=skip_dim, depth=2,
-                d_state=d_state, d_state_supp=d_state_supp,
-                use_supp_scan=use_supp_scan,
-            ))
+    # ── forward ──────────────────────────────────────────────────────────────
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
+        f1, f2, f3, f4 = self.encoder(x)
+        if self.scam is not None:
+            f4 = self.scam(f4, ordered=self.scam_ordered)
+        aux, h = [], f4
+        for i, (layer, skip) in enumerate(zip(self.decoder, (f3, f2, f1))):
+            h = layer(h, skip)
+            if return_aux:
+                aux.append(self.aux_heads[i](h))
+        logits = self.head(self.final_expand(h)).permute(0, 3, 1, 2)
+        return (logits, aux) if return_aux else logits
 
-        # ── Deep supervision heads ────────────────────────────────────────────
-        # Auxiliary losses at each decoder stage accelerate gradient flow
-        # through the decoder during early training.
-        # scale_factor: how much to upsample the decoder output to reach H×W
-        #   Dec0 output: H/16, W/16 → need ×16
-        #   Dec1 output: H/8,  W/8  → need ×8
-        #   Dec2 output: H/4,  W/4  → need ×4  (same as final head)
-        self.aux_heads = nn.ModuleList([
-            DeepSupHead(feat_dims[2], num_classes, scale_factor=16),  # dec0
-            DeepSupHead(feat_dims[1], num_classes, scale_factor=8),   # dec1
-            DeepSupHead(feat_dims[0], num_classes, scale_factor=4),   # dec2
-        ])
-        self.use_deep_sup = True   # can disable at inference
+    # ── PEFT helpers ─────────────────────────────────────────────────────────
+    def freeze_encoder(self):
+        """All pretrained encoder weights frozen; only *_supp params train."""
+        for name, p in self.encoder.named_parameters():
+            p.requires_grad_("_supp" in name)
 
-        # ── Final refinement + segmentation head ──────────────────────────────
-        self.seg_head = FinalPatchExpanding(feat_dims[0], num_classes)
+    def encoder_ss2d(self) -> List[SS2D]:
+        return [m for m in self.encoder.modules() if isinstance(m, SS2D)]
 
-        # MIM head is attached dynamically during adaptation stage
-        self.mim_head: Optional[MIMHead] = None
-
-        if freeze_encoder:
-            self._apply_peft_freeze()
-
-    # ── PEFT freeze ──────────────────────────────────────────────────────────
-
-    def _apply_peft_freeze(self):
-        """Freeze encoder + bottleneck. Decoder, aux heads, seg head stay trainable."""
-        for p in self.patch_embed.parameters():
-            p.requires_grad_(False)
-        for stage in self.encoder_stages:
-            stage.freeze_pretrained()
-            if stage.downsample is not None:
-                for p in stage.downsample.parameters():
-                    p.requires_grad_(False)
-        for blk in self.bottleneck:
-            blk.freeze_pretrained()
-        # Decoder, skip gates, aux heads, seg head → all trainable
-        for stage in self.decoder_stages:
-            for p in stage.parameters():
-                p.requires_grad_(True)
-        for head in self.aux_heads:
-            for p in head.parameters():
-                p.requires_grad_(True)
-        for p in self.seg_head.parameters():
-            p.requires_grad_(True)
-
-    # ── statistics ───────────────────────────────────────────────────────────
+    def enable_lora(self, rank=4, alpha=8.0, targets=("in_proj", "out_proj")):
+        for ss2d in self.encoder_ss2d():
+            for t in targets:
+                setattr(ss2d, t, LoRALinear(getattr(ss2d, t), rank, alpha))
 
     def trainable_param_count(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -794,105 +479,149 @@ class PEFTUMamba(nn.Module):
     def total_param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def get_trainable_params(self) -> List[nn.Parameter]:
-        return [p for p in self.parameters() if p.requires_grad]
+    def param_report(self) -> Dict[str, float]:
+        def n(mod, only_trainable=True):
+            return sum(p.numel() for p in mod.parameters()
+                       if p.requires_grad or not only_trainable) / 1e6
+        supp = sum(p.numel() for nm, p in self.named_parameters()
+                   if "_supp" in nm and p.requires_grad) / 1e6
+        enc_supp = sum(p.numel() for nm, p in self.encoder.named_parameters()
+                       if "_supp" in nm and p.requires_grad) / 1e6
+        return {
+            "total": self.total_param_count() / 1e6,
+            "trainable": self.trainable_param_count() / 1e6,
+            "encoder_trainable": n(self.encoder),
+            "supp_all": supp,
+            "supp_encoder": enc_supp,
+            "scam": n(self.scam) if self.scam is not None else 0.0,
+            "decoder": n(self.decoder),
+        }
 
-    # ── optional heads ───────────────────────────────────────────────────────
 
-    def add_mim_head(self, patch_size: int = 4, in_chans: int = 3):
-        self.mim_head = MIMHead(self.feat_dims[0], patch_size, in_chans)
+# =========================================================================== #
+#  Pretrained weight loading — verified
+# =========================================================================== #
 
-    def enable_lora(self, rank: int = 4, alpha: float = 8.0):
-        for m in self.modules():
-            if isinstance(m, SupplementarySSM):
-                m.x_proj = LoRALinear(m.x_proj, rank=rank, alpha=alpha)
+_KEY_RULES = [
+    (r"^module\.", ""),
+    (r"^backbone\.", ""),
+    (r"^encoder\.", ""),
+    (r"\.op\.", ".self_attention."),                 # later VMamba naming
+    (r"(\.blocks\.\d+)\.norm\.", r"\1.ln_1."),       # later VMamba naming
+]
 
-    # ── pretrained weight loading ─────────────────────────────────────────────
 
-    def load_pretrained_vmamba(self, ckpt_path: str, strict: bool = False):
-        ckpt  = torch.load(ckpt_path, map_location="cpu")
-        state = ckpt.get("model", ckpt.get("state_dict", ckpt))
-        miss, unexp = self.load_state_dict(state, strict=strict)
-        print(f"[Pretrained] {ckpt_path}")
-        print(f"  Missing: {len(miss)}  Unexpected: {len(unexp)}")
-        return miss, unexp
+def _remap(key: str) -> str:
+    for pat, rep in _KEY_RULES:
+        key = re.sub(pat, rep, key)
+    return key
 
-    # ── forward ──────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor,
-                mim_mask: Optional[torch.Tensor] = None,
-                return_aux: bool = False):
-        """
-        x          : [B, 3, H, W]
-        return_aux : if True, also returns list of aux logits for deep supervision
-                     (used during training only — set by train.py)
+def load_vmamba_pretrained(encoder: VMambaEncoder, ckpt_path: str) -> int:
+    """
+    Load ImageNet VMamba-Tiny weights into the encoder.
+    Every frozen encoder tensor must load with a matching shape, otherwise a
+    RuntimeError is raised (this prevents silently training on a random
+    encoder).  Supplementary (*_supp) parameters are not in the checkpoint.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state = ckpt.get("model", ckpt.get("state_dict", ckpt))
+    state = {_remap(k): v for k, v in state.items()}
 
-        Returns
-        -------
-        Training (return_aux=True):
-            main_logits [B,C,H,W],  [aux0, aux1, aux2] each [B,C,H,W]
-        Inference (return_aux=False):
-            main_logits [B,C,H,W]
-        """
-        x = self.patch_embed(x)
+    target = encoder.state_dict()
+    required = [k for k in target if "_supp" not in k]
+    to_load, wrong_shape = {}, []
+    for k in required:
+        if k in state:
+            if state[k].shape == target[k].shape:
+                to_load[k] = state[k]
+            else:
+                wrong_shape.append(
+                    f"{k}: ckpt {tuple(state[k].shape)} vs model {tuple(target[k].shape)}")
+    missing = [k for k in required if k not in to_load]
 
-        skips = []
-        for stage in self.encoder_stages:
-            x, skip = stage(x)
-            skips.append(skip)
+    if missing:
+        msg = [f"[Pretrained] {len(missing)}/{len(required)} encoder tensors "
+               f"could not be loaded from {ckpt_path}."]
+        if wrong_shape:
+            msg.append("Shape mismatches (first 10):")
+            msg += ["  " + s for s in wrong_shape[:10]]
+        absent = [k for k in missing if k not in state][:10]
+        if absent:
+            msg.append("Not found in checkpoint (first 10):")
+            msg += ["  " + k for k in absent]
+            msg.append("Checkpoint keys (first 10): " +
+                       ", ".join(list(state)[:10]))
+        msg.append("This model expects the ORIGINAL VMamba-Tiny release "
+                   "(K=16, depths 2-2-9-2, no MLP).")
+        raise RuntimeError("\n".join(msg))
 
-        for blk in self.bottleneck:
-            x = blk(x)
-
-        if mim_mask is not None and self.mim_head is not None:
-            return self.mim_head(x)
-
-        # Decoder with deep supervision
-        aux_logits = []
-        for i, stage in enumerate(self.decoder_stages):
-            x = stage(x, skips[2 - i])
-            if return_aux:
-                aux_logits.append(self.aux_heads[i](x))
-
-        main = self.seg_head(x)
-
-        if return_aux:
-            return main, aux_logits
-        return main
+    encoder.load_state_dict(to_load, strict=False)
+    print(f"[Pretrained] loaded {len(to_load)}/{len(required)} encoder "
+          f"tensors from {ckpt_path}")
+    return len(to_load)
 
 
 # =========================================================================== #
 #  Builder
 # =========================================================================== #
 
+ORDERED_DATASETS = {"dataset702", "dataset701"}   # volumetric: ordered slices
+
+
 def build_model(cfg) -> PEFTUMamba:
-    mc = cfg.model
-    pc = cfg.model.peft
-    sc = cfg.model.ssm
+    """
+    Reads (with defaults):
+      cfg.model.num_classes, depths, feat_dims, pretrained_path, freeze_encoder
+      cfg.model.ssm.d_state                     (16)
+      cfg.model.peft.supp_state_dim             (K′, 4)
+      cfg.model.peft.use_supplementary_scan     (True)
+      cfg.model.peft.supp_init                  ("neighbourhood" | "s4d")
+      cfg.model.peft.no_skip_gate               (False)
+      cfg.model.peft.use_lora / lora_rank / lora_alpha
+      cfg.model.use_scam                        (True)
+      cfg.model.scam_hidden                     (64)
+      cfg.model.decoder_depth                   (2)
+      cfg.data.ordered                          (SCAM: batch = one ordered sequence)
+    """
+    mc, pc = cfg.model, cfg.model.peft
+    use_supp = getattr(pc, "use_supplementary_scan", True)
+    k_prime = pc.supp_state_dim if use_supp else 0
+    dataset = getattr(cfg.data, "dataset", "")
 
     model = PEFTUMamba(
-        img_size      = mc.img_size,
-        in_channels   = 3,
-        num_classes   = mc.num_classes,
-        depths        = mc.depths,
-        feat_dims     = mc.feat_dims,
-        d_state       = sc.d_state,
-        d_state_supp  = pc.supp_state_dim,
-        use_supp_scan = pc.use_supplementary_scan,
-        freeze_encoder= mc.freeze_encoder,
+        num_classes=mc.num_classes,
+        depths=tuple(getattr(mc, "depths", (2, 2, 9, 2))),
+        dims=tuple(getattr(mc, "feat_dims", (96, 192, 384, 768))),
+        d_state=mc.ssm.d_state,
+        d_state_supp=k_prime,
+        decoder_depth=getattr(mc, "decoder_depth", 2),
+        use_scam=getattr(mc, "use_scam", True),
+        scam_hidden=getattr(mc, "scam_hidden", 64),
+        use_skip_gate=not getattr(pc, "no_skip_gate", False),
+        scam_ordered=getattr(cfg.data, "ordered", dataset in ORDERED_DATASETS),
     )
 
-    if mc.pretrained_path:
-        model.load_pretrained_vmamba(mc.pretrained_path, strict=False)
-        if mc.freeze_encoder:
-            model._apply_peft_freeze()
+    ckpt_path = getattr(mc, "pretrained_path", None)
+    if ckpt_path:
+        load_vmamba_pretrained(model.encoder, ckpt_path)
+    else:
+        print("[Pretrained] WARNING: no checkpoint given — encoder is random")
 
-    if pc.use_lora:
+    # Neighbourhood Initialisation needs the loaded A_frz → run after loading
+    init = getattr(pc, "supp_init", "neighbourhood")
+    for m in model.modules():
+        if isinstance(m, SS2D) and m.d_state_supp > 0:
+            m.reset_supplementary(init)
+
+    if getattr(mc, "freeze_encoder", True):
+        model.freeze_encoder()
+    if getattr(pc, "use_lora", False):
         model.enable_lora(rank=pc.lora_rank, alpha=pc.lora_alpha)
 
-    n_tr = model.trainable_param_count()
-    n_to = model.total_param_count()
-    print(f"[Model] Trainable: {n_tr/1e6:.2f}M / Total: {n_to/1e6:.2f}M "
-          f"({100*n_tr/n_to:.1f}%)")
-
+    r = model.param_report()
+    print(f"[Model] total={r['total']:.2f}M  trainable={r['trainable']:.3f}M  "
+          f"(supp all={r['supp_all']:.3f}M, supp encoder={r['supp_encoder']:.3f}M, "
+          f"SCAM={r['scam']:.3f}M, decoder={r['decoder']:.3f}M)  "
+          f"K'={k_prime}  init={init}  SCAM ordered={model.scam_ordered}")
     return model
