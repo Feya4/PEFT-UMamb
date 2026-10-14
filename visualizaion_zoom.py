@@ -1,21 +1,3 @@
-"""
-visualize_table6.py — qualitative comparison of the Table 6 adaptation
-strategies (Reviewer 1, Comment 1.3).
-
-Loads the FINAL checkpoint of every method for one dataset and seed, predicts
-the same validation cases, and draws one row per case:
-    image | ground truth | frozen | LoRA | full FT | Mona | LoRand | E3VA | PEFT-UMamba
-with the per-case DSC above each prediction.
-
-Cases are chosen objectively from PEFT-UMamba's own per-case DSC ranking
-(25th, 50th and 75th percentile, plus the worst case), so the figure is
-representative and includes a failure case rather than only the best examples.
-
-    python visualize_table6.py --dataset kvasir     --data_root /path/kvasir
-    python visualize_table6.py --dataset dataset702 --data_root /path/Dataset702_AbdomenMR
-Output: outputs/figures/table6_<dataset>_s<seed>.png / .pdf
-"""
-
 import argparse
 import json
 import sys
