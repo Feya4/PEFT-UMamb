@@ -1,3 +1,31 @@
+"""
+data/dataset.py — data loading for PEFT-UMamba (manuscript §4.1–4.2).
+
+Supported layouts
+─────────────────
+  nnU-Net raw  (Dataset701/702/703/704):
+      <root>/dataset.json, <root>/imagesTr/<case>_0000<ext>, <root>/labelsTr/<case><ext>
+      NIfTI volumes (.nii.gz) → "volume" datasets; PNG/TIF/JPG → "image2d".
+  Kvasir-SEG:
+      <root>/images/*.jpg + <root>/masks/*.jpg   (also <root>/Kvasir-SEG/...)
+
+Volumes (AMOS22 MRI, AbdomenCT)
+  • reoriented to RAS, resampled to 1.5 mm isotropic, intensity-normalised,
+    cached once as .npz under <root>/_cache_peft_umamba/
+  • processed as 2-D axial slices resized to img_size × img_size
+  • TRAINING batches are ordered runs of T adjacent slices from ONE volume
+    (T = batch size) so SCAM sees a real slice sequence; every slice of a
+    run receives the same augmentation, so the order stays meaningful
+  • VALIDATION predicts whole volumes in ordered chunks of T slices
+
+2-D images (Kvasir-SEG, EndoVis17, NeurIPS CellSeg)
+  • resized to img_size, unordered batches (SCAM sees length-1 sequences)
+
+Splits
+  One fixed train/val split per dataset (split_seed, val_fraction), written to
+  <root>/splits_peft_umamba.json and reused by every method and every seed.
+"""
+
 import json
 import math
 import random
@@ -7,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 
 from configs.config import resolve_dataset_key
 
@@ -52,11 +80,22 @@ def _strip_ext(name: str) -> str:
     return Path(name).stem
 
 
-def discover_cases(root: Path) -> List[Tuple[str, List[Path], Path]]:
+def discover_test_cases(root: Path) -> List[Tuple[str, List[Path], Path]]:
+    """Official labelled test set (nnU-Net raw imagesTs/ + labelsTs/), if present."""
+    if not ((root / "imagesTs").is_dir() and (root / "labelsTs").is_dir()):
+        return []
+    try:
+        return discover_cases(root, "imagesTs", "labelsTs")
+    except FileNotFoundError:
+        return []
+
+
+def discover_cases(root: Path, img_sub: str = "imagesTr", lbl_sub: str = "labelsTr"
+                   ) -> List[Tuple[str, List[Path], Path]]:
     """Returns [(case_id, [image channel files], label file), ...]."""
     dj = _read_dataset_json(root)
     ending = dj.get("file_ending") if dj else None
-    img_dir, lbl_dir = root / "imagesTr", root / "labelsTr"
+    img_dir, lbl_dir = root / img_sub, root / lbl_sub
     cases = []
     if img_dir.is_dir() and lbl_dir.is_dir():
         for lbl in sorted(p for p in lbl_dir.iterdir() if p.is_file()):
@@ -69,7 +108,7 @@ def discover_cases(root: Path) -> List[Tuple[str, List[Path], Path]]:
                 chans = [img_dir / f"{case}{ext}"]
             if chans:
                 cases.append((case, chans, lbl))
-        if cases:
+        if cases or img_sub != "imagesTr":
             return cases
     for cand in (root, root / "Kvasir-SEG", root / "kvasir" / "Kvasir-SEG"):
         im, mk = cand / "images", cand / "masks"
@@ -89,7 +128,17 @@ def discover_cases(root: Path) -> List[Tuple[str, List[Path], Path]]:
 
 def get_split(root: Path, case_ids: List[str], val_fraction: float,
               seed: int) -> Tuple[List[str], List[str]]:
-    """Fixed split, saved to disk so every method/seed uses the same cases."""
+    """Fixed split, saved to disk so every method/seed uses the same cases.
+    A predefined split in <root>/splits_fixed.json ({"train": [...], "val": [...]},
+    e.g. the official ACDC patient split) takes priority."""
+    fixed = root / "splits_fixed.json"
+    if fixed.exists():
+        sp = json.loads(fixed.read_text())
+        known = set(case_ids)
+        tr = [c for c in sp["train"] if c in known]
+        va = [c for c in sp["val"] if c in known]
+        print(f"[Split] using predefined split {fixed.name}")
+        return tr, va
     path = root / "splits_peft_umamba.json"
     key = f"seed{seed}_val{val_fraction}"
     store = json.loads(path.read_text()) if path.exists() else {}
@@ -123,12 +172,17 @@ def _normalise(img: np.ndarray, modality: str) -> np.ndarray:
 
 
 def load_volume(case: str, img_path: Path, lbl_path: Path, spacing: float,
-                modality: str, cache_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Returns (image [D,H,W] float32, label [D,H,W] uint8), D = axial."""
-    cache = cache_dir / f"{case}_{spacing:.2f}.npz"
+                modality: str, cache_dir: Path, resample_z: bool = True
+                ) -> Tuple[np.ndarray, np.ndarray, Tuple[float, float, float]]:
+    """Returns (image [D,H,W] float32, label [D,H,W] uint8, spacing (z,y,x) mm).
+    resample_z=False keeps the native slice spacing (thick-slice MRI, e.g. ACDC)
+    and resamples only in-plane."""
+    tag = "" if resample_z else "_xy"
+    cache = cache_dir / f"{case}_{spacing:.2f}{tag}.npz"
     if cache.exists():
         z = np.load(cache)
-        return z["image"].astype(np.float32), z["label"]
+        sp = tuple(float(v) for v in z["spacing"]) if "spacing" in z else (spacing,) * 3
+        return z["image"].astype(np.float32), z["label"], sp
     import nibabel as nib
     from scipy import ndimage
 
@@ -137,14 +191,17 @@ def load_volume(case: str, img_path: Path, lbl_path: Path, spacing: float,
     img = img_nii.get_fdata(dtype=np.float32)
     lbl = np.rint(lbl_nii.get_fdata(dtype=np.float32)).astype(np.uint8)
     zooms = [float(z) for z in img_nii.header.get_zooms()[:3]]
-    factors = [z / spacing for z in zooms]
+    factors = [zooms[0] / spacing, zooms[1] / spacing,
+               zooms[2] / spacing if resample_z else 1.0]
     img = ndimage.zoom(img, factors, order=1)
     lbl = ndimage.zoom(lbl, factors, order=0)
     img = _normalise(img.transpose(2, 1, 0), modality)       # [X,Y,Z] → [Z,Y,X]
     lbl = lbl.transpose(2, 1, 0).astype(np.uint8)
+    sp = (spacing if resample_z else zooms[2], spacing, spacing)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(cache, image=img.astype(np.float16), label=lbl)
-    return img, lbl
+    np.savez_compressed(cache, image=img.astype(np.float16), label=lbl,
+                        spacing=np.array(sp, dtype=np.float32))
+    return img, lbl, sp
 
 
 # =========================================================================== #
@@ -223,10 +280,11 @@ class OrderedSliceRuns(Dataset):
 
     def __getitem__(self, i):
         v = int(np.searchsorted(self.cum, i, side="right"))
-        img, lbl = self.vols[v]
+        img, lbl = self.vols[v][0], self.vols[v][1]
         D = img.shape[0]
-        start = int(torch.randint(0, max(D - self.T, 0) + 1, (1,)))
-        idx = np.clip(np.arange(start, start + self.T), 0, D - 1)
+        T = min(self.T, D)                    # short stacks: whole volume, no padding
+        start = int(torch.randint(0, D - T + 1, (1,)))
+        idx = np.arange(start, start + T)
         x = slices_to_input(img[idx], self.size)
         y = resize_label(torch.from_numpy(lbl[idx].astype(np.int64)), self.size)
         x, y = augment(x, y, rgb=False, rotation_deg=self.rot)
@@ -241,8 +299,8 @@ class VolumeVal(Dataset):
         return len(self.vols)
 
     def __getitem__(self, i):
-        img, lbl = self.vols[i]
-        return {"image": img, "label": lbl, "case": self.cases[i]}
+        img, lbl, sp = self.vols[i]
+        return {"image": img, "label": lbl, "spacing": np.array(sp), "case": self.cases[i]}
 
 
 def _read_array(path: Path) -> np.ndarray:
@@ -304,6 +362,70 @@ class Image2DDataset(Dataset):
                 "label": lbl[0].contiguous(), "case": case}
 
 
+def _read_instance_mask(path: Path) -> np.ndarray:
+    """Instance-id mask (16/32-bit TIFF or PNG)."""
+    try:
+        import tifffile
+        return np.asarray(tifffile.imread(str(path))).squeeze().astype(np.int64)
+    except Exception:
+        return _read_array(path).squeeze().astype(np.int64)
+
+
+def instances_to_semantic(inst: np.ndarray) -> np.ndarray:
+    """0 background, 1 cell interior, 2 cell boundary (4-neighbourhood)."""
+    b = np.zeros(inst.shape, bool)
+    b[1:, :] |= inst[1:, :] != inst[:-1, :]
+    b[:-1, :] |= inst[:-1, :] != inst[1:, :]
+    b[:, 1:] |= inst[:, 1:] != inst[:, :-1]
+    b[:, :-1] |= inst[:, :-1] != inst[:, 1:]
+    sem = np.zeros(inst.shape, np.int64)
+    sem[inst > 0] = 1
+    sem[(inst > 0) & b] = 2
+    return sem
+
+
+def discover_cellseg_val(root: Path):
+    """Official NeurIPS-CellSeg tuning set in the U-Mamba layout:
+    imagesVal/<case>_0000.<ext> + labelsVal-instance-mask/<case>_label.tiff"""
+    im_dir, lb_dir = root / "imagesVal", root / "labelsVal-instance-mask"
+    if not (im_dir.is_dir() and lb_dir.is_dir()):
+        return []
+    labels = {}
+    for p in lb_dir.iterdir():
+        c = _strip_ext(p.name)
+        labels[c[:-6] if c.endswith("_label") else c] = p
+    out = []
+    for p in sorted(im_dir.iterdir()):
+        if p.suffix.lower() not in IMG_EXTS:
+            continue
+        c = _strip_ext(p.name)
+        c = c[:-5] if c.endswith("_0000") else c
+        if c in labels:
+            out.append((c, [p], labels[c]))
+    return out
+
+
+class CellValDataset(Dataset):
+    """Official CellSeg evaluation: image resized to the network input; label
+    returned (i) as 3-class semantic map at the input size, for DSC, and
+    (ii) as the native-resolution instance mask, for instance F1."""
+
+    def __init__(self, cases, img_size: int):
+        self.cases, self.size = cases, img_size
+
+    def __len__(self):
+        return len(self.cases)
+
+    def __getitem__(self, i):
+        case, img_paths, lbl_path = self.cases[i]
+        img = torch.from_numpy(_load_image_file(img_paths)).permute(2, 0, 1)[None]
+        inst = _read_instance_mask(lbl_path)
+        sem = torch.from_numpy(instances_to_semantic(inst))[None]
+        return {"image": normalise_rgb(resize_image(img, self.size)[0]).contiguous(),
+                "label": resize_label(sem, self.size)[0].contiguous(),
+                "instances": torch.from_numpy(inst), "case": case}
+
+
 # =========================================================================== #
 #  Builder
 # =========================================================================== #
@@ -325,8 +447,16 @@ def build_loaders(cfg):
     cfg.model.num_classes = len(names)
 
     by_id = {c[0]: c for c in cases}
-    tr_ids, va_ids = get_split(root, list(by_id), dc.val_fraction, dc.split_seed)
-    print(f"[Data] {key}: {len(cases)} cases → {len(tr_ids)} train / "
+    test = [] if (root / "splits_fixed.json").exists() else discover_test_cases(root)
+    if test:
+        # official labelled test set: train on all of imagesTr, report on imagesTs
+        # (the same test cases as the published baselines)
+        tr_ids, va_ids = sorted(by_id), [c[0] for c in test]
+        by_id.update({c[0]: c for c in test})
+        print(f"[Split] official test set imagesTs/labelsTs ({len(va_ids)} cases)")
+    else:
+        tr_ids, va_ids = get_split(root, list(by_id), dc.val_fraction, dc.split_seed)
+    print(f"[Data] {key}: {len(by_id)} cases → {len(tr_ids)} train / "
           f"{len(va_ids)} val, {len(names)} classes, kind={dc.kind}")
 
     if dc.kind == "volume":
@@ -336,7 +466,8 @@ def build_loaders(cfg):
             out = []
             for n, cid in enumerate(ids, 1):
                 c, imgs, lbl = by_id[cid]
-                out.append(load_volume(c, imgs[0], lbl, dc.spacing, dc.modality, cache))
+                out.append(load_volume(c, imgs[0], lbl, dc.spacing, dc.modality, cache,
+                                       getattr(dc, "resample_z", True)))
                 if n % 10 == 0 or n == len(ids):
                     print(f"  loaded {n}/{len(ids)} volumes")
             return out
@@ -344,29 +475,51 @@ def build_loaders(cfg):
         train_ds = OrderedSliceRuns(load(tr_ids), tc.batch_size, dc.img_size,
                                     tc.rotation_deg)
         val_ds = VolumeVal(load(va_ids), va_ids)
-        train_loader = DataLoader(train_ds, batch_size=None, shuffle=True,
+        ipe = getattr(tc, "iters_per_epoch", None)
+        sampler = (RandomSampler(train_ds, replacement=True, num_samples=ipe)
+                   if ipe else RandomSampler(train_ds))
+        train_loader = DataLoader(train_ds, batch_size=None, sampler=sampler,
                                   num_workers=dc.num_workers, pin_memory=True,
                                   persistent_workers=dc.num_workers > 0)
         val_loader = DataLoader(val_ds, batch_size=None, shuffle=False,
                                 num_workers=0)
     else:
         binary = key == "kvasir"
+        cell_val = discover_cellseg_val(root) if key == "dataset703" else []
+        if cell_val:
+            # official tuning set: train on all of imagesTr, evaluate on imagesVal
+            tr_ids = sorted(c[0] for c in cases)
+            print(f"[Split] official CellSeg tuning set imagesVal ({len(cell_val)} images, "
+                  f"instance masks); training on all {len(tr_ids)} imagesTr")
         train_ds = Image2DDataset([by_id[i] for i in tr_ids], dc.img_size, True,
                                   binary, tc.rotation_deg)
-        val_ds = Image2DDataset([by_id[i] for i in va_ids], dc.img_size, False,
-                                binary, 0.0)
+        if cell_val:
+            val_ds = CellValDataset(cell_val, dc.img_size)
+            val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2)
+        else:
+            val_ds = Image2DDataset([by_id[i] for i in va_ids], dc.img_size, False,
+                                    binary, 0.0)
         train_loader = DataLoader(train_ds, batch_size=tc.batch_size, shuffle=True,
                                   num_workers=dc.num_workers, pin_memory=True,
                                   drop_last=True,
                                   persistent_workers=dc.num_workers > 0)
-        val_loader = DataLoader(val_ds, batch_size=tc.batch_size, shuffle=False,
-                                num_workers=dc.num_workers)
+        if not cell_val:
+            val_loader = DataLoader(val_ds, batch_size=tc.batch_size, shuffle=False,
+                                    num_workers=dc.num_workers)
     return train_loader, val_loader, names
 
 
 # =========================================================================== #
 #  Volume inference (ordered chunks → SCAM sees real slice sequences)
 # =========================================================================== #
+
+AMP_DTYPE = torch.float16          # train.py switches to bfloat16 for full fine-tuning
+
+
+def set_amp_dtype(dtype):
+    global AMP_DTYPE
+    AMP_DTYPE = dtype
+
 
 @torch.no_grad()
 def predict_volume(model, vol: np.ndarray, img_size: int, chunk: int,
@@ -375,7 +528,8 @@ def predict_volume(model, vol: np.ndarray, img_size: int, chunk: int,
     pred = np.zeros((D, H, W), dtype=np.uint8)
     for s in range(0, D, chunk):
         x = slices_to_input(vol[s:s + chunk], img_size).to(device)
-        with torch.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
+        with torch.autocast(device_type=device.type, dtype=AMP_DTYPE,
+                            enabled=use_amp and device.type == "cuda"):
             logits = model(x)
         logits = F.interpolate(logits.float(), size=(H, W), mode="bilinear",
                                align_corners=False)
