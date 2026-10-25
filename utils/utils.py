@@ -194,12 +194,30 @@ def hd95_per_class(pred: np.ndarray, gt: np.ndarray, num_classes: int,
 
 
 def instance_f1(pred: np.ndarray, gt: np.ndarray, interior_class: int = 1,
-                iou_thr: float = 0.5) -> float:
-    """Instance F1 at IoU>0.5. Instances = connected components of the
-    cell-interior class in prediction and ground truth."""
+                iou_thr: float = 0.5, gt_instances: Optional[np.ndarray] = None) -> float:
+    """Instance F1 at IoU>0.5. Predicted instances = connected components of
+    the cell-interior class. Ground-truth instances = the given instance mask
+    (official CellSeg labels) or, if absent, connected components of gt."""
     from scipy import ndimage
     pl, npred = ndimage.label(pred == interior_class)
-    gl, ngt = ndimage.label(gt == interior_class)
+    if gt_instances is not None and npred > 0:
+        # whole-cell prediction: grow each interior component into the
+        # predicted boundary pixels (the GT instances include the boundary)
+        grow = pred > 0
+        for _ in range(3):
+            d = ndimage.grey_dilation(pl, size=3)
+            fill = (pl == 0) & grow & (d > 0)
+            if not fill.any():
+                break
+            pl[fill] = d[fill]
+    if gt_instances is not None:
+        ids, gl = np.unique(gt_instances, return_inverse=True)
+        gl = gl.reshape(gt_instances.shape)
+        if ids[0] != 0:                      # no background id present
+            gl = gl + 1
+        ngt = int(gl.max())
+    else:
+        gl, ngt = ndimage.label(gt == interior_class)
     if npred == 0 and ngt == 0:
         return 1.0
     if npred == 0 or ngt == 0:
@@ -221,16 +239,18 @@ class SegMetrics:
                  compute_hd95: bool = False, compute_instance_f1: bool = False):
         self.C, self.names = num_classes, class_names
         self.hd, self.inst = compute_hd95, compute_instance_f1
-        self.dice, self.hd95, self.f1 = [], [], []
+        self.dice, self.hd95, self.f1, self.cases = [], [], [], []
 
     def add_case(self, pred: np.ndarray, gt: np.ndarray,
-                 spacing: Optional[Sequence[float]] = None):
+                 spacing: Optional[Sequence[float]] = None, case: Optional[str] = None,
+                 inst_f1: Optional[float] = None):
         self.dice.append(dice_per_class(pred, gt, self.C))
+        self.cases.append(case)
         if self.hd:
             sp = spacing if spacing is not None else (1.0,) * gt.ndim
             self.hd95.append(hd95_per_class(pred, gt, self.C, sp))
         if self.inst:
-            self.f1.append(instance_f1(pred, gt))
+            self.f1.append(inst_f1 if inst_f1 is not None else instance_f1(pred, gt))
 
     def compute(self) -> Dict[str, float]:
         d = np.stack(self.dice)                       # [cases, C-1]
@@ -238,6 +258,8 @@ class SegMetrics:
         res = {"dice": float(np.nanmean(case_mean)),
                "dice_std": float(np.nanstd(case_mean)),
                "n_cases": int(len(case_mean))}
+        if all(c is not None for c in self.cases):        # for sequence-level analyses
+            res["per_case_dice"] = {str(c): float(v) for c, v in zip(self.cases, case_mean)}
         for i, n in enumerate(self.names[1:]):
             res[f"dice_{n}"] = float(np.nanmean(d[:, i])) if np.any(~np.isnan(d[:, i])) else float("nan")
         if self.hd95:
