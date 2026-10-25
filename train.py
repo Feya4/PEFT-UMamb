@@ -4,6 +4,7 @@ import dataclasses
 import json
 import math
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation on shared GPUs
 import sys
 import time
 from pathlib import Path
@@ -11,17 +12,18 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from configs.config import config_from_dataset_name
-from data.dataset import build_loaders, predict_volume
+from data.dataset import build_loaders, predict_volume, set_amp_dtype
 from models.model import build_model, HAS_MAMBA_CUDA
 from peft_baselines import apply_peft
 from utils.utils import (AverageMeter, DiceCELoss, SegMetrics, build_optimizer,
                          build_scheduler, count_params, deep_supervision_loss,
-                         get_logger, load_checkpoint, measure_inference_ms,
-                         save_checkpoint, set_seed)
+                         get_logger, instance_f1, load_checkpoint,
+                         measure_inference_ms, save_checkpoint, set_seed)
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CKPT = ROOT / "data" / "vmamba" / "vssmtiny_dp01_ckpt_epoch_292.pth"
@@ -47,6 +49,9 @@ def parse_args():
     p.add_argument("--k_prime", type=int, default=4, help="K′ supplementary dims")
     p.add_argument("--no_supp_scan", action="store_true", help="Table 5 B")
     p.add_argument("--no_scam", action="store_true", help="Table 5 C")
+    p.add_argument("--scam_unordered", action="store_true",
+                   help="control: same SCAM, but each slice is its own sequence "
+                        "(isolates sequence aggregation from the GRU bottleneck)")
     p.add_argument("--no_skip_gate", action="store_true", help="Table 5 D")
     p.add_argument("--no_deep_sup", action="store_true", help="Table 5 E")
     p.add_argument("--supp_init", default="neighbourhood",
@@ -63,7 +68,14 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--eval_every", type=int, default=10)
     p.add_argument("--no_amp", action="store_true")
+    p.add_argument("--amp_dtype", default="auto", choices=["auto", "fp16", "bf16"],
+                   help="auto = bf16 for full fine-tuning (fp16 overflows when all "
+                        "encoder weights train), fp16 otherwise")
     p.add_argument("--max_train_steps", type=int, help="smoke test: steps per epoch")
+    p.add_argument("--iters_per_epoch", type=int,
+                   help="volumes: iterations per epoch (default 250; 0 = one full pass)")
+    p.add_argument("--skip_done", action="store_true",
+                   help="exit immediately if this experiment already has results.json")
 
     p.add_argument("--output_dir", default=str(ROOT / "outputs"))
     p.add_argument("--exp_name")
@@ -81,6 +93,7 @@ def make_config(args):
     pe.no_skip_gate = args.no_skip_gate
     pe.lora_rank = args.lora_rank
     m.use_scam = not args.no_scam
+    m.scam_unordered = args.scam_unordered
     t.deep_sup = not args.no_deep_sup
 
     pe.use_supplementary_scan = (args.method == "peft_umamba"
@@ -99,6 +112,9 @@ def make_config(args):
     t.use_amp = not args.no_amp
     t.seed = args.seed
     t.max_train_steps = args.max_train_steps
+    ipe = getattr(args, "iters_per_epoch", None)
+    if ipe is not None:
+        t.iters_per_epoch = ipe or None
     t.output_dir = args.output_dir
 
     if args.exp_name:
@@ -114,6 +130,8 @@ def make_config(args):
                 tag.append("noNI")
         if args.no_scam:
             tag.append("noSCAM")
+        if args.scam_unordered:
+            tag.append("scamNoSeq")
         if args.no_skip_gate:
             tag.append("noGate")
         if args.no_deep_sup:
@@ -127,30 +145,45 @@ def make_config(args):
 #  Evaluation
 # =========================================================================== #
 
+AMP_DTYPE = torch.float16
+
+
 def _np(x):
     return x.numpy() if torch.is_tensor(x) else np.asarray(x)
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, cfg, names, device):
+def evaluate(model, val_loader, cfg, names, device, final=True):
     model.eval()
     dc, tc = cfg.data, cfg.train
-    metrics = SegMetrics(len(names), names, compute_hd95=dc.kind == "volume",
+    # HD95 (CPU distance transforms) only for the reported final evaluation
+    metrics = SegMetrics(len(names), names, compute_hd95=dc.kind == "volume" and final,
                          compute_instance_f1=dc.instance_f1)
     amp = tc.use_amp and device.type == "cuda"
     if dc.kind == "volume":
         for item in val_loader:
             vol, gt = _np(item["image"]).astype(np.float32), _np(item["label"])
             pred = predict_volume(model, vol, dc.img_size, tc.batch_size, device, amp)
-            metrics.add_case(pred, gt, spacing=(dc.spacing,) * 3)
+            sp = tuple(float(v) for v in _np(item["spacing"])) if "spacing" in item \
+                else (dc.spacing,) * 3
+            metrics.add_case(pred, gt, spacing=sp, case=item.get("case"))
     else:
         for batch in val_loader:
             x = batch["image"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, enabled=amp):
-                pred = model(x).argmax(1).cpu().numpy()
+            with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=amp):
+                logits = model(x)
+            pred = logits.argmax(1).cpu().numpy()
             gt = batch["label"].numpy()
+            cases = batch.get("case", [None] * pred.shape[0])
             for b in range(pred.shape[0]):
-                metrics.add_case(pred[b], gt[b])
+                f1 = None
+                if "instances" in batch:      # official CellSeg: F1 at native resolution
+                    inst = batch["instances"][b].numpy()
+                    up = F.interpolate(logits[b:b + 1].float(), size=inst.shape,
+                                       mode="bilinear", align_corners=False)
+                    f1 = instance_f1(up.argmax(1)[0].cpu().numpy(), None,
+                                     gt_instances=inst)
+                metrics.add_case(pred[b], gt[b], case=cases[b], inst_f1=f1)
     model.train()
     return metrics.compute()
 
@@ -164,7 +197,23 @@ def main():
     cfg = make_config(args)
     tc, dc = cfg.train, cfg.data
     out_dir = Path(tc.output_dir) / tc.experiment_name
+    if args.skip_done and (out_dir / "results.json").exists():
+        print(f"[skip] {tc.experiment_name} already finished")
+        return
+    # lock: several queues may share one run list (e.g. two queues per GPU)
+    lock = out_dir / "RUNNING"
+    if args.skip_done and lock.exists():
+        try:
+            os.kill(int(lock.read_text().split()[0]), 0)
+            print(f"[skip] {tc.experiment_name} is running in another queue")
+            return
+        except (ValueError, IndexError, ProcessLookupError):
+            pass                                   # stale lock: owner is gone
+        except PermissionError:
+            print(f"[skip] {tc.experiment_name} is running in another queue")
+            return
     out_dir.mkdir(parents=True, exist_ok=True)
+    lock.write_text(str(os.getpid()))
     log = get_logger("peft_umamba", str(out_dir / "train.log"))
 
     set_seed(tc.seed)
@@ -195,7 +244,8 @@ def main():
              f"encoder-adaptation {adapt_params/1e6:.3f}M")
     log.info(f"Protocol: epochs {tc.epochs}  batch {tc.batch_size}  lr {tc.base_lr}  "
              f"wd {tc.weight_decay}  warmup {tc.warmup_epochs}ep  poly {tc.poly_power}  "
-             f"deep_sup {tc.deep_sup} {tc.deep_sup_weights}  ordered={dc.ordered}")
+             f"deep_sup {tc.deep_sup} {tc.deep_sup_weights}  ordered={dc.ordered}  "
+             f"iters/epoch {len(train_loader)}")
 
     criterion = DiceCELoss(len(names), tc.ce_weight, tc.dice_weight)
     optimizer = build_optimizer(model, tc.base_lr, tc.weight_decay)
@@ -204,7 +254,12 @@ def main():
     scheduler = build_scheduler(optimizer, tc.epochs * steps,
                                 tc.warmup_epochs * steps, tc.poly_power)
     amp = tc.use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    global AMP_DTYPE
+    AMP_DTYPE = torch.bfloat16 if (args.amp_dtype == "bf16" or (
+        args.amp_dtype == "auto" and args.method == "full_ft")) else torch.float16
+    set_amp_dtype(AMP_DTYPE)
+    log.info(f"mixed precision: {'off' if not amp else AMP_DTYPE}")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and AMP_DTYPE == torch.float16)
 
     start_epoch = 0
     if args.resume:
@@ -222,7 +277,7 @@ def main():
                 break
             x = batch["image"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, enabled=amp):
+            with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=amp):
                 logits, aux = model(x, return_aux=True)
                 loss = deep_supervision_loss(criterion, logits, aux, y,
                                              tc.deep_sup_weights, tc.deep_sup)
@@ -246,7 +301,7 @@ def main():
 
         last = epoch + 1 == tc.epochs
         if (epoch + 1) % tc.eval_every == 0 and not last:
-            r = evaluate(model, val_loader, cfg, names, device)
+            r = evaluate(model, val_loader, cfg, names, device, final=False)
             log.info(f"  [monitor] val dice {r['dice']:.4f}")
             save_checkpoint({"epoch": epoch + 1, "model": model.state_dict(),
                              "optimizer": optimizer.state_dict(),
@@ -294,6 +349,7 @@ def main():
                         if "hd95" in res else ""))
     log.info(f"[Table6] trainable {train_params/1e6:.3f}M  adapt {adapt_params/1e6:.3f}M  "
              f"mem {peak_gb:.2f}GB  infer {infer_ms:.2f}ms")
+    lock.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
