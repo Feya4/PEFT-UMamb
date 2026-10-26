@@ -22,19 +22,7 @@ Paper section → code
   §4.2  Deep supervision at three decoder resolutions        → aux heads
   Table 6 baselines: frozen encoder (K′=0), LoRA, full fine-tuning;
         Mona / LoRand via peft_baselines.py (blocks are named VSSBlock /
-        self_attention, which that module expects).
-"""
-import math
-import re
-from typing import Dict, List, Optional, Tuple
+  """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-    HAS_MAMBA_CUDA = True
-except ImportError:                                    # pragma: no cover
-    selective_scan_fn = None
-    HAS_MAMBA_CUDA = False
+The Code coming soon...
+        
